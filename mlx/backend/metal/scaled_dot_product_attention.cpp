@@ -443,6 +443,7 @@ void sdpa_vector_2pass(
   char devc = d.get_architecture().back();
   int N = k.shape(2);
   int blocks;
+
   if (devc == 's') {
     blocks = 64;
     if (N > 1024 && n_simds > 4) {
