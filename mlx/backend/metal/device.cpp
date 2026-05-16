@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <sstream>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -28,6 +29,8 @@ struct hash<NS::SharedPtr<T>> {
 } // namespace std
 
 namespace mlx::core::metal {
+
+const char* embedded_default_library();
 
 namespace {
 
@@ -77,6 +80,47 @@ std::pair<MTL::Library*, NS::Error*> load_library_from_path(
   auto lib = device->newLibrary(library, &error);
 
   return std::make_pair(lib, error);
+}
+
+std::pair<MTL::Library*, std::string> build_embedded_default_library(
+    MTL::Device* device) {
+  auto pool = new_scoped_memory_pool();
+  auto ns_code = NS::String::string(
+      embedded_default_library(), NS::UTF8StringEncoding);
+
+  NS::Error* error = nullptr;
+  auto options = MTL::CompileOptions::alloc()->init();
+  options->setFastMathEnabled(false);
+  options->setLanguageVersion(get_metal_version());
+#ifndef NDEBUG
+  if (options->languageVersion() >= MTL::LanguageVersion3_2) {
+    options->setEnableLogging(true);
+  }
+#endif
+  auto lib = device->newLibrary(ns_code, options, &error);
+  options->release();
+  if (lib) {
+    return {lib, ""};
+  }
+  std::ostringstream msg;
+  if (error) {
+    msg << error->localizedDescription()->utf8String();
+  } else {
+    msg << "Metal returned no library and no error";
+  }
+  return {nullptr, msg.str()};
+}
+
+std::string default_library_search_summary() {
+  std::ostringstream msg;
+  auto binary_dir = current_binary_dir();
+  msg << "Searched paths: "
+      << (binary_dir / "mlx.metallib") << "; "
+      << (binary_dir / "Resources/mlx.metallib") << "; "
+      << "SwiftPM bundle " << SWIFTPM_BUNDLE << ".bundle/default.metallib; "
+      << (binary_dir / "Resources/default.metallib") << "; "
+      << default_mtllib_path << ". ";
+  return msg.str();
 }
 
 #ifdef SWIFTPM_BUNDLE
@@ -190,8 +234,15 @@ MTL::Library* load_default_library(MTL::Device* device) {
   // Finally try default_mtllib_path
   std::tie(lib, error[4]) = load_library_from_path(device, default_mtllib_path);
   if (!lib) {
+    auto [embedded_lib, embedded_error] = build_embedded_default_library(device);
+    if (embedded_lib) {
+      return embedded_lib;
+    }
     std::ostringstream msg;
-    msg << "Failed to load the default metallib. ";
+    msg << "Failed to load the default metallib. "
+        << default_library_search_summary()
+        << "Embedded-source fallback was attempted and failed: "
+        << embedded_error << ". ";
     for (int i = 0; i < 5; i++) {
       if (error[i] != nullptr) {
         msg << error[i]->localizedDescription()->utf8String() << " ";
