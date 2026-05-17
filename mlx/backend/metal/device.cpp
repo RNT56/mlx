@@ -16,8 +16,6 @@
 
 namespace mlx::core::metal {
 
-const char* embedded_default_library();
-
 namespace {
 
 constexpr const char* default_mtllib_path = METAL_PATH;
@@ -55,48 +53,36 @@ std::pair<MTL::Library*, NS::Error*> load_library_from_path(
   return std::make_pair(lib, error);
 }
 
-std::pair<MTL::Library*, std::string> build_embedded_default_library(
-    MTL::Device* device) {
-  auto pool = new_scoped_memory_pool();
-  auto ns_code = NS::String::string(
-      embedded_default_library(), NS::UTF8StringEncoding);
-
-  NS::Error* error = nullptr;
-  auto options = MTL::CompileOptions::alloc()->init();
-  options->setFastMathEnabled(false);
-  options->setLanguageVersion(get_metal_version());
-#ifndef NDEBUG
-  if (options->languageVersion() >= MTL::LanguageVersion3_2) {
-    options->setEnableLogging(true);
-  }
-#endif
-  auto lib = device->newLibrary(ns_code, options, &error);
-  options->release();
-  if (lib) {
-    return {lib, ""};
-  }
-  std::ostringstream msg;
-  if (error) {
-    msg << error->localizedDescription()->utf8String();
-  } else {
-    msg << "Metal returned no library and no error";
-  }
-  return {nullptr, msg.str()};
-}
-
 std::string default_library_search_summary() {
   std::ostringstream msg;
   auto binary_dir = current_binary_dir();
   msg << "Searched paths: "
       << (binary_dir / "mlx.metallib") << "; "
       << (binary_dir / "Resources/mlx.metallib") << "; "
+#ifdef SWIFTPM_BUNDLE
       << "SwiftPM bundle " << SWIFTPM_BUNDLE << ".bundle/default.metallib; "
+      << "SwiftPM bundle in binary directory ancestors; "
+#endif
       << (binary_dir / "Resources/default.metallib") << "; "
       << default_mtllib_path << ". ";
   return msg.str();
 }
 
 #ifdef SWIFTPM_BUNDLE
+MTL::Library* try_load_swiftpm_bundle_path(
+    MTL::Device* device,
+    const std::filesystem::path& root,
+    const std::string& lib_name) {
+  auto resource_path =
+      root / (std::string(SWIFTPM_BUNDLE) + ".bundle") /
+      (lib_name + ".metallib");
+  auto [lib, error] = load_library_from_path(device, resource_path.c_str());
+  if (lib) {
+    return lib;
+  }
+  return nullptr;
+}
+
 MTL::Library* try_load_bundle(
     MTL::Device* device,
     NS::URL* url,
@@ -147,7 +133,17 @@ std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
     MTL::Device* device,
     const std::string& lib_name) {
 #ifdef SWIFTPM_BUNDLE
-  MTL::Library* library =
+  MTL::Library* library = nullptr;
+  auto root = current_binary_dir();
+  for (int i = 0; i < 5 && !root.empty(); ++i) {
+    library = try_load_swiftpm_bundle_path(device, root, lib_name);
+    if (library != nullptr) {
+      return {library, nullptr};
+    }
+    root = root.parent_path();
+  }
+
+  library =
       try_load_bundle(device, NS::Bundle::mainBundle()->bundleURL(), lib_name);
   if (library != nullptr) {
     return {library, nullptr};
@@ -207,15 +203,9 @@ MTL::Library* load_default_library(MTL::Device* device) {
   // Finally try default_mtllib_path
   std::tie(lib, error[4]) = load_library_from_path(device, default_mtllib_path);
   if (!lib) {
-    auto [embedded_lib, embedded_error] = build_embedded_default_library(device);
-    if (embedded_lib) {
-      return embedded_lib;
-    }
     std::ostringstream msg;
     msg << "Failed to load the default metallib. "
-        << default_library_search_summary()
-        << "Embedded-source fallback was attempted and failed: "
-        << embedded_error << ". ";
+        << default_library_search_summary();
     for (int i = 0; i < 5; i++) {
       if (error[i] != nullptr) {
         msg << error[i]->localizedDescription()->utf8String() << " ";
