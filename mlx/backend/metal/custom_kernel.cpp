@@ -46,6 +46,8 @@ std::string write_signature(
       std::string param_type;
       if (std::holds_alternative<int>(arg)) {
         param_type = "int";
+      } else if (std::holds_alternative<uint32_t>(arg)) {
+        param_type = "uint";
       } else if (std::holds_alternative<bool>(arg)) {
         param_type = "bool";
       } else if (std::holds_alternative<Dtype>(arg)) {
@@ -161,6 +163,8 @@ std::string write_template(
     }
     if (std::holds_alternative<int>(arg)) {
       template_def << std::get<int>(arg);
+    } else if (std::holds_alternative<uint32_t>(arg)) {
+      template_def << std::get<uint32_t>(arg) << "u";
     } else if (std::holds_alternative<bool>(arg)) {
       template_def << std::get<bool>(arg);
     } else if (std::holds_alternative<Dtype>(arg)) {

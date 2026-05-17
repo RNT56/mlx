@@ -36,7 +36,9 @@ std::string template_arguments_hash(
 
   for (const auto& [name, arg] : template_args) {
     if (std::holds_alternative<int>(arg)) {
-      hash += fmt::format("_{}", std::get<int>(arg));
+      hash += fmt::format("_i{}", std::get<int>(arg));
+    } else if (std::holds_alternative<uint32_t>(arg)) {
+      hash += fmt::format("_u{}", std::get<uint32_t>(arg));
     } else if (std::holds_alternative<bool>(arg)) {
       hash += (std::get<bool>(arg)) ? "_t" : "_f";
     } else if (std::holds_alternative<Dtype>(arg)) {
@@ -120,6 +122,11 @@ std::string build_kernel(
       if (std::holds_alternative<int>(arg)) {
         kernel_source +=
             fmt::format("  constexpr int {} = {};\n", name, std::get<int>(arg));
+      } else if (std::holds_alternative<uint32_t>(arg)) {
+        kernel_source += fmt::format(
+            "  constexpr unsigned int {} = {}u;\n",
+            name,
+            std::get<uint32_t>(arg));
       } else if (std::holds_alternative<bool>(arg)) {
         kernel_source += fmt::format(
             "  constexpr bool {} = {};\n", name, std::get<bool>(arg));

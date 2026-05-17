@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <variant>
 
@@ -54,7 +55,7 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
-using TemplateArg = std::variant<int, bool, Dtype>;
+using TemplateArg = std::variant<int, uint32_t, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
 using CustomKernelFunction = std::function<std::vector<array>(
