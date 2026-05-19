@@ -83,8 +83,7 @@ std::pair<MTL::Library*, NS::Error*> load_library_from_path(
 std::string default_library_search_summary() {
   std::ostringstream msg;
   auto binary_dir = current_binary_dir();
-  msg << "Searched paths: "
-      << (binary_dir / "mlx.metallib") << "; "
+  msg << "Searched paths: " << (binary_dir / "mlx.metallib") << "; "
       << (binary_dir / "Resources/mlx.metallib") << "; "
 #ifdef SWIFTPM_BUNDLE
       << "SwiftPM bundle " << SWIFTPM_BUNDLE << ".bundle/default.metallib; "
@@ -96,26 +95,10 @@ std::string default_library_search_summary() {
 }
 
 #ifdef SWIFTPM_BUNDLE
-MTL::Library* try_load_swiftpm_bundle_path(
+MTL::Library* try_load_bundle_path(
     MTL::Device* device,
-    const std::filesystem::path& root,
+    const std::string& bundle_path,
     const std::string& lib_name) {
-  auto resource_path =
-      root / (std::string(SWIFTPM_BUNDLE) + ".bundle") /
-      (lib_name + ".metallib");
-  auto [lib, error] = load_library_from_path(device, resource_path.c_str());
-  if (lib) {
-    return lib;
-  }
-  return nullptr;
-}
-
-MTL::Library* try_load_bundle(
-    MTL::Device* device,
-    NS::URL* url,
-    const std::string& lib_name) {
-  std::string bundle_path = std::string(url->fileSystemRepresentation()) + "/" +
-      SWIFTPM_BUNDLE + ".bundle";
   auto bundle = NS::Bundle::alloc()->init(
       NS::String::string(bundle_path.c_str(), NS::UTF8StringEncoding));
   if (bundle != nullptr) {
@@ -128,6 +111,15 @@ MTL::Library* try_load_bundle(
     }
   }
   return nullptr;
+}
+
+MTL::Library* try_load_bundle(
+    MTL::Device* device,
+    NS::URL* url,
+    const std::string& lib_name) {
+  std::string bundle_path = std::string(url->fileSystemRepresentation()) + "/" +
+      SWIFTPM_BUNDLE + ".bundle";
+  return try_load_bundle_path(device, bundle_path, lib_name);
 }
 
 MTL::Library* try_load_framework(
@@ -160,17 +152,20 @@ std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
     MTL::Device* device,
     const std::string& lib_name) {
 #ifdef SWIFTPM_BUNDLE
-  MTL::Library* library = nullptr;
-  auto root = current_binary_dir();
-  for (int i = 0; i < 5 && !root.empty(); ++i) {
-    library = try_load_swiftpm_bundle_path(device, root, lib_name);
+  const std::string swiftpm_bundle_name =
+      std::string(SWIFTPM_BUNDLE) + ".bundle";
+
+  auto binary_dir = current_binary_dir();
+  for (int i = 0; i < 4 && !binary_dir.empty(); ++i) {
+    MTL::Library* library = try_load_bundle_path(
+        device, (binary_dir / swiftpm_bundle_name).string(), lib_name);
     if (library != nullptr) {
       return {library, nullptr};
     }
-    root = root.parent_path();
+    binary_dir = binary_dir.parent_path();
   }
 
-  library =
+  MTL::Library* library =
       try_load_bundle(device, NS::Bundle::mainBundle()->bundleURL(), lib_name);
   if (library != nullptr) {
     return {library, nullptr};
@@ -178,6 +173,16 @@ std::pair<MTL::Library*, NS::Error*> load_swiftpm_library(
   auto bundles = NS::Bundle::allBundles();
   for (int i = 0, c = (int)bundles->count(); i < c; i++) {
     auto bundle = reinterpret_cast<NS::Bundle*>(bundles->object(i));
+    const auto bundle_url = bundle->bundleURL();
+    const std::string bundle_path = bundle_url->fileSystemRepresentation();
+    if (bundle_path.size() >= swiftpm_bundle_name.size() &&
+        bundle_path.rfind(swiftpm_bundle_name) ==
+            bundle_path.size() - swiftpm_bundle_name.size()) {
+      library = try_load_framework(device, bundle->resourceURL(), lib_name);
+      if (library != nullptr) {
+        return {library, nullptr};
+      }
+    }
     library = try_load_bundle(device, bundle->resourceURL(), lib_name);
     if (library != nullptr) {
       return {library, nullptr};
