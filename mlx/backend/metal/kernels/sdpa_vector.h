@@ -183,6 +183,7 @@ constant bool has_affine_bias [[function_constant(27)]];
 constant int quant_mode_int [[function_constant(28)]];
 constant int quant_bits [[function_constant(29)]];
 constant int quant_group_size [[function_constant(30)]];
+constant int quant_q_seq_len [[function_constant(31)]];
 
 template <int group_size, int elem_per_thread, int granularity>
 struct GroupSlice {
@@ -400,9 +401,10 @@ METAL_FUNC void quant_sdpa_vector_2pass_1_impl(
   // elem_per_thread=D/4 is large enough for all pack_factors (max 8).
   //
   // GQA: multiple query heads sharing the same KV head are packed into the
-  // same threadgroup (along with q_seq_len) to share L2 cache for KV data.
-  //   Grid:  (num_kv_heads, batch, blocks)
-  //   Group: (32, gqa_factor, q_seq_len)
+  // same threadgroup to share L2 cache for KV data. Query sequence rows are
+  // mapped into grid.z so verifier batches do not exceed threadgroup limits.
+  //   Grid:  (num_kv_heads, batch, blocks * q_seq_len)
+  //   Group: (32, gqa_factor, 1)
   using Cfg = QuantConfig<mode>;
   using ScaleT = ScaleTypeT<mode, T>;
 
@@ -427,11 +429,11 @@ METAL_FUNC void quant_sdpa_vector_2pass_1_impl(
   // Head/batch from grid + threadgroup position
   const int kv_head_idx = tid.x;
   const int batch_idx = tid.y;
-  const int block_idx = tid.z;
+  const int block_idx = tid.z / quant_q_seq_len;
   const int gqa_factor = tptg.y;
-  const int q_seq_len = tptg.z;
+  const int q_seq_len = quant_q_seq_len;
   const int gqa_offset = tidtg.y;
-  const int q_seq_idx = tidtg.z;
+  const int q_seq_idx = tid.z % quant_q_seq_len;
   const int num_kv_heads = tpg.x;
   const int num_q_heads = num_kv_heads * gqa_factor;
   const int q_head_idx = gqa_factor * kv_head_idx + gqa_offset;

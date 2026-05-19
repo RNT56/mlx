@@ -661,7 +661,8 @@ void quant_sdpa_vector_2pass(
 
   int N = k.shape(2);
   int gqa_factor = q.shape(1) / k.shape(1);
-  int n_simds = gqa_factor * q.shape(2);
+  int q_seq_len = q.shape(2);
+  int n_simds = gqa_factor * q_seq_len;
 
   char devc = d.get_architecture().back();
   int blocks =
@@ -675,8 +676,8 @@ void quant_sdpa_vector_2pass(
   size_t v_group_stride =
       v_scales.shape(1) == 1 ? v_scales.strides(0) : v_scales.strides(1);
 
-  MTL::Size group_dims(32, gqa_factor, q.shape(2));
-  MTL::Size grid_dims(k.shape(1), q.shape(0), blocks);
+  MTL::Size group_dims(32, gqa_factor, 1);
+  MTL::Size grid_dims(k.shape(1), q.shape(0), blocks * q_seq_len);
 
   Shape intermediate_shape;
   intermediate_shape.reserve(out.ndim() + 1);
@@ -711,6 +712,7 @@ void quant_sdpa_vector_2pass(
       {&quant_mode_int, MTL::DataType::DataTypeInt, 28},
       {&bits, MTL::DataType::DataTypeInt, 29},
       {&group_size, MTL::DataType::DataTypeInt, 30},
+      {&q_seq_len, MTL::DataType::DataTypeInt, 31},
   };
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
@@ -721,6 +723,7 @@ void quant_sdpa_vector_2pass(
   hash_name += std::to_string(quant_mode_int) + "_";
   hash_name += std::to_string(bits) + "_";
   hash_name += std::to_string(group_size) + "_";
+  hash_name += std::to_string(q_seq_len) + "_";
   hash_name += std::to_string(blocks);
 
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -871,11 +874,11 @@ bool QuantizedScaledDotProductAttention::use_fallback(
   int key_sequence_length = k.shape(2);
   int query_head_dim = q.shape(-1);
   int gqa_factor = q.shape(1) / k.shape(1);
-  return query_sequence_length > 8 ||
+  return query_sequence_length > 32 ||
       query_sequence_length > key_sequence_length ||
       !(query_head_dim == 64 || query_head_dim == 128 ||
         query_head_dim == 256 || query_head_dim == 512) ||
-      (query_sequence_length * gqa_factor > 32);
+      (gqa_factor > 32);
 }
 
 void ScaledDotProductAttention::eval_gpu(

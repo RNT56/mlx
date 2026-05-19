@@ -788,6 +788,45 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     tol = 5e-2 if bits == 4 else 2e-2
                     self.assertLess((out - ref).abs().max(), tol)
 
+    def test_quantized_sdpa_gqa_verifier_batches(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Quantized fast attention is only available on GPU.")
+
+        mx.random.seed(0)
+        B, Hq, Hkv = 1, 8, 1
+        Lk = 256
+
+        for Lq, D, dtype, mode in product(
+            [9, 32],
+            [128, 512],
+            [mx.float16, mx.bfloat16],
+            ["mxfp4", "mxfp8"],
+        ):
+            with self.subTest(Lq=Lq, D=D, dtype=dtype, mode=mode):
+                bits = 8 if mode == "mxfp8" else 4
+                q = (0.1 * mx.random.normal(shape=(B, Hq, Lq, D))).astype(dtype)
+                k = (0.1 * mx.random.normal(shape=(B, Hkv, Lk, D))).astype(dtype)
+                v = (0.1 * mx.random.normal(shape=(B, Hkv, Lk, D))).astype(dtype)
+
+                k_q, k_scales = mx.quantize(k, mode=mode)
+                v_q, v_scales = mx.quantize(v, mode=mode)
+
+                ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0)
+                out = mx.fast.quantized_scaled_dot_product_attention(
+                    q,
+                    k_q,
+                    k_scales,
+                    v_q,
+                    v_scales,
+                    scale=1.0,
+                    mode=mode,
+                    bits=bits,
+                )
+
+                self.assertEqual(out.shape, ref.shape)
+                tol = 8e-2 if bits == 4 else 3e-2
+                self.assertLess((out - ref).abs().max(), tol)
+
     def test_quantized_sdpa_affine(self):
         if mx.default_device() == mx.cpu:
             self.skipTest("Quantized fast attention is only available on GPU.")
