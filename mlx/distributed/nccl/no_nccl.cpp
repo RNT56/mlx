@@ -12,7 +12,8 @@ bool is_available() {
 
 std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
   if (strict) {
-    throw std::runtime_error("Cannot initialize nccl distributed backend.");
+    throw UnsupportedBackendError(
+        "Cannot initialize nccl distributed backend.");
   }
   return nullptr;
 }

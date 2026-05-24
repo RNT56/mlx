@@ -261,7 +261,7 @@ inline void bootstrap_unique_id(
     int rank,
     int size,
     const std::string& initMethod) {
-  throw std::runtime_error(
+  throw UnsupportedBackendError(
       "[nccl] Distributed NCCL is not yet supported on Windows");
 }
 #endif // _WIN32
@@ -358,11 +358,31 @@ class NCCLGroup : public GroupImpl {
   }
 
   void send(const array& input, int dst, Stream stream) override {
-    throw std::runtime_error("[nccl] Send not supported in NCCL backend.");
+    detail::dispatch_dtype(input, [&](auto type_tag, ncclDataType_t dt) {
+      using T = typename decltype(type_tag)::type;
+      auto& encoder = cu::get_command_encoder(stream);
+      CHECK_NCCL(ncclSend(
+          gpu_ptr<T>(input),
+          input.size(),
+          dt,
+          dst,
+          comm_->comm,
+          encoder.stream()));
+    });
   }
 
   void recv(array& output, int src, Stream stream) override {
-    throw std::runtime_error("[nccl] Recv not supported in NCCL backend.");
+    detail::dispatch_dtype(output, [&](auto type_tag, ncclDataType_t dt) {
+      using T = typename decltype(type_tag)::type;
+      auto& encoder = cu::get_command_encoder(stream);
+      CHECK_NCCL(ncclRecv(
+          gpu_ptr<T>(output),
+          output.size(),
+          dt,
+          src,
+          comm_->comm,
+          encoder.stream()));
+    });
   }
 
   void all_max(const array& input, array& output, Stream stream) override {
@@ -444,7 +464,7 @@ std::string get_env_var_or_throw(const char* env_var_name, bool strict) {
     msg << "[nccl] Required environment variable '" << env_var_name
         << "' is not set. "
         << "Please set it before initializing the distributed backend.";
-    throw std::runtime_error(msg.str());
+    throw UnsupportedBackendError(msg.str());
   }
   if (value == nullptr) {
     return "";

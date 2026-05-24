@@ -129,6 +129,7 @@ struct MPIWrapper {
     LOAD_SYMBOL(MPI_Comm_free, comm_free);
     LOAD_SYMBOL(MPI_Allreduce, all_reduce);
     LOAD_SYMBOL(MPI_Allgather, all_gather);
+    LOAD_SYMBOL(MPI_Reduce_scatter_block, reduce_scatter_block);
     LOAD_SYMBOL(MPI_Send, send);
     LOAD_SYMBOL(MPI_Recv, recv);
     LOAD_SYMBOL(MPI_Type_contiguous, mpi_type_contiguous);
@@ -289,6 +290,13 @@ struct MPIWrapper {
       void*,
       int,
       MPI_Datatype,
+      MPI_Comm);
+  int (*reduce_scatter_block)(
+      const void*,
+      void*,
+      int,
+      MPI_Datatype,
+      MPI_Op,
       MPI_Comm);
   int (*comm_split)(MPI_Comm, int, int, MPI_Comm*);
   int (*comm_free)(MPI_Comm*);
@@ -473,7 +481,17 @@ class MPIGroup : public GroupImpl {
   }
 
   void sum_scatter(const array& input, array& output, Stream stream) override {
-    throw std::runtime_error("[mpi] sum_scatter not yet implemented.");
+    auto& encoder = cpu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    encoder.dispatch(
+        mpi().reduce_scatter_block,
+        input.data<void>(),
+        output.data<void>(),
+        output.size(),
+        mpi().datatype(input),
+        mpi().op_sum(input),
+        comm_);
   }
 
  private:
@@ -490,7 +508,7 @@ bool is_available() {
 std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
   if (!mpi().init_safe()) {
     if (strict) {
-      throw std::runtime_error("Cannot initialize MPI");
+      throw UnsupportedBackendError("Cannot initialize MPI");
     }
     return nullptr;
   }

@@ -167,14 +167,16 @@ std::tuple<std::vector<PathNode>, size_t, int> greedy_path(
   // Helper struct for building the greedy path
   struct Contraction {
     Contraction(
-        size_t size,
+        int64_t size,
         size_t cost,
+        size_t new_size,
         CharSet output,
         int dims,
         int x,
         int y)
         : size(size),
           cost(cost),
+          new_size(new_size),
           output(std::move(output)),
           dims(dims),
           x(x),
@@ -182,10 +184,39 @@ std::tuple<std::vector<PathNode>, size_t, int> greedy_path(
 
     int64_t size; // Size difference, can be negative
     size_t cost;
+    size_t new_size;
     CharSet output;
     int dims; // Number of dimensions in the contraction
     int x;
     int y;
+  };
+
+  auto make_output_subscript = [&](const Contraction& contraction) {
+    std::string out_str;
+    out_str.reserve(contraction.output.size());
+    CharSet used;
+    auto append_from = [&](const std::string& term) {
+      for (auto c : term) {
+        if (contraction.output.find(c) != contraction.output.end() &&
+            used.insert(c).second) {
+          out_str.push_back(c);
+        }
+      }
+    };
+
+    append_from(inputs[contraction.x].str);
+    append_from(inputs[contraction.y].str);
+    append_from(output.str);
+
+    std::vector<char> remaining;
+    for (auto c : contraction.output) {
+      if (used.find(c) == used.end()) {
+        remaining.push_back(c);
+      }
+    }
+    std::sort(remaining.begin(), remaining.end());
+    out_str.insert(out_str.end(), remaining.begin(), remaining.end());
+    return out_str;
   };
 
   // Start by iterating over all possible combinations
@@ -239,7 +270,13 @@ std::tuple<std::vector<PathNode>, size_t, int> greedy_path(
         return;
       }
       possible_contractions.emplace_back(
-          removed_size, cost, std::move(new_term), contractions.size(), p1, p2);
+          removed_size,
+          cost,
+          new_size,
+          std::move(new_term),
+          contractions.size(),
+          p1,
+          p2);
     };
 
     for (auto& [p1, p2] : pos_pairs) {
@@ -274,16 +311,20 @@ std::tuple<std::vector<PathNode>, size_t, int> greedy_path(
         possible_contractions.begin(),
         possible_contractions.end(),
         [](const auto& x, const auto& y) {
-          return x.size > y.size || (x.size == y.size && x.cost < y.cost);
+          return x.cost < y.cost ||
+              (x.cost == y.cost &&
+               (x.new_size < y.new_size ||
+                (x.new_size == y.new_size &&
+                 (x.size > y.size ||
+                  (x.size == y.size &&
+                   (x.dims < y.dims ||
+                    (x.dims == y.dims &&
+                     std::tie(x.x, x.y) < std::tie(y.x, y.y))))))));
         });
     path_scaling = std::max(best.dims, path_scaling);
 
     // Construct the output subscripts
-    std::string out_str(best.output.begin(), best.output.end());
-    // TODO, sorting by dimension size seems suboptimal?
-    std::sort(out_str.begin(), out_str.end(), [&dim_map](auto x, auto y) {
-      return dim_map[x] < dim_map[y];
-    });
+    auto out_str = make_output_subscript(best);
     Subscript new_output(std::move(out_str), std::move(best.output));
 
     // Add the chosen contraction to the path

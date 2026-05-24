@@ -55,6 +55,19 @@ class TestConv(mlx_tests.MLXTestCase):
         expected = mx.array([4.0, 4.0, 10.0, 10.0]).reshape(1, 2, 2)
         self.assertTrue(mx.allclose(out, expected))
 
+    def test_conv_2d_groups_manual_reference(self):
+        x = mx.random.normal((2, 8, 8, 4))
+        w = mx.random.normal((8, 3, 3, 2))
+        grouped = mx.conv2d(x, w, padding=1, groups=2)
+        manual = mx.concatenate(
+            [
+                mx.conv2d(xg, wg, padding=1)
+                for xg, wg in zip(mx.split(x, 2, axis=-1), mx.split(w, 2, axis=0))
+            ],
+            axis=-1,
+        )
+        self.assertTrue(mx.allclose(grouped, manual, rtol=1e-5, atol=1e-5))
+
     @unittest.skipIf(not has_torch, "requires Torch")
     def test_torch_conv_1D(self):
         def run_conv1D(

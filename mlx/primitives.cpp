@@ -4193,6 +4193,54 @@ std::pair<std::vector<array>, std::vector<int>> Scan::vmap(
       axes};
 }
 
+array scan_window_mask(
+    int size,
+    bool reverse,
+    bool inclusive,
+    const Stream& s) {
+  auto idx = arange(size, int32, s);
+  auto input_pos = expand_dims(idx, 1, s);
+  auto output_pos = expand_dims(idx, 0, s);
+
+  if (reverse) {
+    return inclusive ? greater_equal(input_pos, output_pos, s)
+                     : greater(input_pos, output_pos, s);
+  }
+  return inclusive ? less_equal(input_pos, output_pos, s)
+                   : less(input_pos, output_pos, s);
+}
+
+array move_scan_axis_to_last(const array& x, int axis, const Stream& s) {
+  return axis == x.ndim() - 1 ? x : moveaxis(x, axis, -1, s);
+}
+
+array move_scan_axis_from_last(const array& x, int axis, const Stream& s) {
+  return axis == x.ndim() - 1 ? x : moveaxis(x, -1, axis, s);
+}
+
+std::pair<array, array> scan_extrema_mask_and_count(
+    const array& x,
+    const array& results,
+    bool reverse,
+    bool inclusive,
+    Dtype count_dtype,
+    const Stream& s) {
+  auto expanded_x = expand_dims(x, x.ndim(), s);
+  auto expanded_results = expand_dims(results, x.ndim() - 1, s);
+  auto mask = logical_and(
+      equal(expanded_x, expanded_results, s),
+      scan_window_mask(x.shape(-1), reverse, inclusive, s),
+      s);
+
+  auto count = sum(astype(mask, count_dtype, s), x.ndim() - 1, true, s);
+  auto safe_count = where(
+      equal(count, array(0, count.dtype()), s),
+      array(1, count.dtype()),
+      count,
+      s);
+  return {mask, safe_count};
+}
+
 std::vector<array> Scan::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -4290,8 +4338,25 @@ std::vector<array> Scan::vjp(
         where(eq_zero, z, grad, stream()),
         stream())};
   } else {
-    // Can probably be implemented by equals and then cummax to make the mask
-    throw std::runtime_error("VJP is not implemented for cumulative min/max");
+    auto s = stream();
+    auto x = move_scan_axis_to_last(primals[0], axis_, s);
+    auto results = move_scan_axis_to_last(outputs[0], axis_, s);
+    auto cotan = move_scan_axis_to_last(cotangents[0], axis_, s);
+    auto [mask, count] = scan_extrema_mask_and_count(
+        x, results, reverse_, inclusive_, cotan.dtype(), s);
+
+    auto weighted_cotan =
+        divide(expand_dims(cotan, x.ndim() - 1, s), count, s);
+    auto grad = sum(
+        where(
+            mask,
+            weighted_cotan,
+            array(0, weighted_cotan.dtype()),
+            s),
+        x.ndim(),
+        false,
+        s);
+    return {move_scan_axis_from_last(grad, axis_, s)};
   }
 }
 
@@ -4304,9 +4369,60 @@ std::vector<array> Scan::jvp(
 
   if (reduce_type_ == Scan::Sum) {
     return {cumsum(tangents[0], axis_, reverse_, inclusive_, stream())};
+  } else if (reduce_type_ == Scan::Prod) {
+    auto s = stream();
+    auto in = primals[0];
+    auto tan = tangents[0];
+    auto zero = array(0, in.dtype());
+    auto tan_zero = array(0, tan.dtype());
+    auto one = array(1, in.dtype());
+
+    auto is_zero = equal(in, zero, s);
+    auto safe_in = where(is_zero, one, in, s);
+    auto nonzero_in = safe_in;
+    auto prod_nonzero = cumprod(nonzero_in, axis_, reverse_, inclusive_, s);
+    auto zero_count = cumsum(
+        astype(is_zero, tan.dtype(), s), axis_, reverse_, inclusive_, s);
+    auto tan_over_in = where(is_zero, tan_zero, divide(tan, safe_in, s), s);
+    auto regular = multiply(
+        cumprod(in, axis_, reverse_, inclusive_, s),
+        cumsum(tan_over_in, axis_, reverse_, inclusive_, s),
+        s);
+    auto zero_tangent_sum = cumsum(
+        where(is_zero, tan, tan_zero, s), axis_, reverse_, inclusive_, s);
+    return {where(
+        equal(zero_count, array(0, zero_count.dtype()), s),
+        regular,
+        where(
+            equal(zero_count, array(1, zero_count.dtype()), s),
+            multiply(prod_nonzero, zero_tangent_sum, s),
+            tan_zero,
+            s),
+        s)};
   } else {
-    throw std::runtime_error(
-        "JVP is not implemented for cumulative prod/min/max");
+    auto s = stream();
+    auto x = move_scan_axis_to_last(primals[0], axis_, s);
+    auto tan = move_scan_axis_to_last(tangents[0], axis_, s);
+    auto results = move_scan_axis_to_last(
+        reduce_type_ == Scan::Min
+            ? cummin(primals[0], axis_, reverse_, inclusive_, s)
+            : cummax(primals[0], axis_, reverse_, inclusive_, s),
+        axis_,
+        s);
+    auto [mask, count] = scan_extrema_mask_and_count(
+        x, results, reverse_, inclusive_, tan.dtype(), s);
+
+    auto weighted_tan = sum(
+        where(
+            mask,
+            expand_dims(tan, x.ndim(), s),
+            array(0, tan.dtype()),
+            s),
+        x.ndim() - 1,
+        true,
+        s);
+    auto out = squeeze(divide(weighted_tan, count, s), x.ndim() - 1, s);
+    return {move_scan_axis_from_last(out, axis_, s)};
   }
 }
 
@@ -4330,18 +4446,91 @@ std::vector<array> Scatter::vjp(
   switch (reduce_type_) {
     case Scatter::None:
     case Scatter::Sum:
+    case Scatter::Prod:
     case Scatter::Max:
     case Scatter::Min:
       break;
-    default:
-      throw std::runtime_error(
-          "[scatter] VJP not implemented for scatter_prod");
   }
 
   const array& result = outputs[0];
   const array& values = primals[0];
   const array& updates = primals.back();
   const std::vector<array> indices(primals.begin() + 1, primals.end() - 1);
+  auto s = stream();
+
+  auto gather_from = [&](const array& arr) {
+    auto slice_sizes = arr.shape();
+    for (auto ax : axes_) {
+      slice_sizes[ax] = 1;
+    }
+    return gather(arr, indices, axes_, slice_sizes, s);
+  };
+
+  auto scatter_zeros = [&](Dtype dtype) {
+    return zeros(values.shape(), dtype, s);
+  };
+
+  auto scatter_prod_update_factors = [&]() {
+    return scatter_prod(ones_like(values, s), indices, updates, axes_, s);
+  };
+
+  auto scatter_prod_update_coefficients = [&]() {
+    auto update_zero = equal(updates, array(0, updates.dtype()), s);
+    auto nonzero_updates =
+        where(update_zero, array(1, updates.dtype()), updates, s);
+    auto zero_count = scatter_add(
+        scatter_zeros(updates.dtype()),
+        indices,
+        astype(update_zero, updates.dtype(), s),
+        axes_,
+        s);
+    auto product_nonzero =
+        scatter_prod(ones_like(values, s), indices, nonzero_updates, axes_, s);
+
+    auto gathered_values = gather_from(values);
+    auto gathered_zero_count = gather_from(zero_count);
+    auto gathered_product_nonzero = gather_from(product_nonzero);
+    auto no_zero_coeff = multiply(
+        gathered_values,
+        divide(gathered_product_nonzero, nonzero_updates, s),
+        s);
+    auto one_zero_coeff =
+        multiply(gathered_values, gathered_product_nonzero, s);
+    return where(
+        equal(gathered_zero_count, array(0, gathered_zero_count.dtype()), s),
+        no_zero_coeff,
+        where(
+            logical_and(
+                equal(
+                    gathered_zero_count,
+                    array(1, gathered_zero_count.dtype()),
+                    s),
+                update_zero,
+                s),
+            one_zero_coeff,
+            array(0, one_zero_coeff.dtype()),
+            s),
+        s);
+  };
+
+  auto extrema_normalizer = [&]() {
+    auto gathered_result = gather_from(result);
+    auto update_matches = equal(updates, gathered_result, s);
+    auto update_count = scatter_add(
+        scatter_zeros(cotangents[0].dtype()),
+        indices,
+        astype(update_matches, cotangents[0].dtype(), s),
+        axes_,
+        s);
+    auto source_count =
+        astype(equal(values, result, s), cotangents[0].dtype(), s);
+    auto count = add(source_count, update_count, s);
+    return where(
+        equal(count, array(0, count.dtype()), s),
+        array(1, count.dtype()),
+        count,
+        s);
+  };
 
   std::vector<array> vjps;
   for (auto num : argnums) {
@@ -4361,18 +4550,20 @@ std::vector<array> Scatter::vjp(
           // The input array values are kept so they all get gradients
           vjps.push_back(cotangents[0]);
           break;
+        case Scatter::Prod:
+          vjps.push_back(
+              multiply(cotangents[0], scatter_prod_update_factors(), stream()));
+          break;
         case Scatter::Max:
         case Scatter::Min: {
+          auto normalizer = extrema_normalizer();
           vjps.push_back(where(
               equal(result, values, stream()),
-              cotangents[0],
+              divide(cotangents[0], normalizer, stream()),
               array(0, cotangents[0].dtype()),
               stream()));
           break;
         }
-        default:
-          // Should never reach here
-          throw std::invalid_argument("");
       }
     } else if (num == primals.size() - 1) {
       switch (reduce_type_) {
@@ -4387,23 +4578,23 @@ std::vector<array> Scatter::vjp(
               gather(cotangents[0], indices, axes_, slice_sizes, stream()));
           break;
         }
-        case Scatter::Max:
-        case Scatter::Min: {
-          auto slice_sizes = cotangents[0].shape();
-          for (auto ax : axes_) {
-            slice_sizes[ax] = 1;
-          }
-          auto gathered_cotan =
-              gather(cotangents[0], indices, axes_, slice_sizes, stream());
-          auto gathered_result =
-              gather(result, indices, axes_, slice_sizes, stream());
-          vjps.push_back(
-              multiply(gathered_cotan, gathered_result == updates, stream()));
+        case Scatter::Prod: {
+          vjps.push_back(multiply(
+              gather_from(cotangents[0]),
+              scatter_prod_update_coefficients(),
+              s));
           break;
         }
-        default: {
-          // Should never reach here
-          throw std::invalid_argument("");
+        case Scatter::Max:
+        case Scatter::Min: {
+          auto normalizer = extrema_normalizer();
+          auto gathered_result = gather_from(result);
+          vjps.push_back(where(
+              equal(gathered_result, updates, stream()),
+              divide(gather_from(cotangents[0]), gather_from(normalizer), s),
+              array(0, cotangents[0].dtype()),
+              s));
+          break;
         }
       }
     } else {
@@ -4418,7 +4609,149 @@ std::vector<array> Scatter::jvp(
     const std::vector<array>& primals,
     const std::vector<array>& tangents,
     const std::vector<int>& argnums) {
-  throw std::runtime_error("[scatter] JVP not yet implemented");
+  const array& values = primals[0];
+  const array& updates = primals.back();
+  const std::vector<array> indices(primals.begin() + 1, primals.end() - 1);
+  auto s = stream();
+
+  for (auto arg : argnums) {
+    if (arg > 0 && arg < primals.size() - 1) {
+      throw std::invalid_argument(
+          "[scatter] Cannot calculate JVP with respect to indices.");
+    }
+  }
+
+  auto tangent_for = [&](int arg, const array& primal) {
+    auto it = std::find(argnums.begin(), argnums.end(), arg);
+    if (it == argnums.end()) {
+      return zeros_like(primal, s);
+    }
+    return tangents[it - argnums.begin()];
+  };
+
+  auto values_tan = tangent_for(0, values);
+  auto updates_tan = tangent_for(primals.size() - 1, updates);
+
+  auto scatter_tangent = [&](const array& src_tan, const array& upd_tan) {
+    std::vector<array> inputs;
+    inputs.reserve(primals.size());
+    inputs.push_back(src_tan);
+    inputs.insert(inputs.end(), indices.begin(), indices.end());
+    inputs.push_back(upd_tan);
+    return array(
+        values.shape(),
+        src_tan.dtype(),
+        std::make_shared<Scatter>(s, reduce_type_, axes_),
+        std::move(inputs));
+  };
+
+  if (reduce_type_ == Scatter::None || reduce_type_ == Scatter::Sum) {
+    return {scatter_tangent(values_tan, updates_tan)};
+  }
+
+  auto gather_from = [&](const array& arr) {
+    auto slice_sizes = arr.shape();
+    for (auto ax : axes_) {
+      slice_sizes[ax] = 1;
+    }
+    return gather(arr, indices, axes_, slice_sizes, s);
+  };
+
+  auto scatter_zeros = [&](Dtype dtype) {
+    return zeros(values.shape(), dtype, s);
+  };
+
+  if (reduce_type_ == Scatter::Prod) {
+    auto update_zero = equal(updates, array(0, updates.dtype()), s);
+    auto nonzero_updates =
+        where(update_zero, array(1, updates.dtype()), updates, s);
+    auto zero_count = scatter_add(
+        scatter_zeros(updates.dtype()),
+        indices,
+        astype(update_zero, updates.dtype(), s),
+        axes_,
+        s);
+    auto product_all =
+        scatter_prod(ones_like(values, s), indices, updates, axes_, s);
+    auto product_nonzero =
+        scatter_prod(ones_like(values, s), indices, nonzero_updates, axes_, s);
+
+    auto source_contribution = multiply(values_tan, product_all, s);
+    auto gathered_values = gather_from(values);
+    auto gathered_zero_count = gather_from(zero_count);
+    auto gathered_product_nonzero = gather_from(product_nonzero);
+    auto no_zero_coeff = multiply(
+        gathered_values,
+        divide(gathered_product_nonzero, nonzero_updates, s),
+        s);
+    auto one_zero_coeff =
+        multiply(gathered_values, gathered_product_nonzero, s);
+    auto update_coeff = where(
+        equal(gathered_zero_count, array(0, gathered_zero_count.dtype()), s),
+        no_zero_coeff,
+        where(
+            logical_and(
+                equal(
+                    gathered_zero_count,
+                    array(1, gathered_zero_count.dtype()),
+                    s),
+                update_zero,
+                s),
+            one_zero_coeff,
+            array(0, one_zero_coeff.dtype()),
+            s),
+        s);
+    auto update_contribution = scatter_add(
+        scatter_zeros(source_contribution.dtype()),
+        indices,
+        multiply(updates_tan, update_coeff, s),
+        axes_,
+        s);
+    return {add(source_contribution, update_contribution, s)};
+  }
+
+  std::vector<array> result_inputs;
+  result_inputs.reserve(primals.size());
+  result_inputs.push_back(values);
+  result_inputs.insert(result_inputs.end(), indices.begin(), indices.end());
+  result_inputs.push_back(updates);
+  auto result = array(
+      values.shape(),
+      values.dtype(),
+      std::make_shared<Scatter>(s, reduce_type_, axes_),
+      std::move(result_inputs));
+  auto gathered_result = gather_from(result);
+  auto update_matches = equal(updates, gathered_result, s);
+  auto update_count = scatter_add(
+      scatter_zeros(values_tan.dtype()),
+      indices,
+      astype(update_matches, values_tan.dtype(), s),
+      axes_,
+      s);
+  auto source_count = astype(equal(values, result, s), values_tan.dtype(), s);
+  auto normalizer = add(source_count, update_count, s);
+  normalizer = where(
+      equal(normalizer, array(0, normalizer.dtype()), s),
+      array(1, normalizer.dtype()),
+      normalizer,
+      s);
+
+  auto source_contribution = where(
+      equal(values, result, s),
+      divide(values_tan, normalizer, s),
+      array(0, values_tan.dtype()),
+      s);
+  auto update_contribution = scatter_add(
+      scatter_zeros(source_contribution.dtype()),
+      indices,
+      where(
+          update_matches,
+          divide(updates_tan, gather_from(normalizer), s),
+          array(0, updates_tan.dtype()),
+          s),
+      axes_,
+      s);
+  return {add(source_contribution, update_contribution, s)};
 }
 
 std::pair<std::vector<array>, std::vector<int>> Scatter::vmap(
@@ -4988,13 +5321,38 @@ std::vector<array> SliceUpdate::vjp(
           vjps.push_back(cotan);
           break;
         case SliceUpdate::Max:
-        case SliceUpdate::Min:
-          vjps.push_back(where(
-              equal(result, values, stream()),
-              cotan,
+        case SliceUpdate::Min: {
+          auto sliced_cotan =
+              slice(cotan, start_indices_, end_indices_, strides_, stream());
+          auto sliced_result =
+              slice(result, start_indices_, end_indices_, strides_, stream());
+          auto sliced_values =
+              slice(values, start_indices_, end_indices_, strides_, stream());
+          auto source_matches = equal(sliced_values, sliced_result, stream());
+          auto update_matches = equal(updates, sliced_result, stream());
+          auto normalizer = add(
+              astype(source_matches, cotan.dtype(), stream()),
+              astype(update_matches, cotan.dtype(), stream()),
+              stream());
+          normalizer = where(
+              equal(normalizer, array(0, normalizer.dtype()), stream()),
+              array(1, normalizer.dtype()),
+              normalizer,
+              stream());
+          auto sliced_source_grad = where(
+              source_matches,
+              divide(sliced_cotan, normalizer, stream()),
               array(0, cotan.dtype()),
+              stream());
+          vjps.push_back(slice_update(
+              cotan,
+              sliced_source_grad,
+              start_indices_,
+              end_indices_,
+              strides_,
               stream()));
           break;
+        }
         case SliceUpdate::Prod:
           vjps.push_back(array(
               cotan.shape(),
@@ -5022,9 +5380,22 @@ std::vector<array> SliceUpdate::vjp(
         case SliceUpdate::Min: {
           auto sliced_result =
               slice(result, start_indices_, end_indices_, strides_, stream());
+          auto sliced_values =
+              slice(values, start_indices_, end_indices_, strides_, stream());
+          auto source_matches = equal(sliced_values, sliced_result, stream());
+          auto update_matches = equal(updates, sliced_result, stream());
+          auto normalizer = add(
+              astype(source_matches, cotan.dtype(), stream()),
+              astype(update_matches, cotan.dtype(), stream()),
+              stream());
+          normalizer = where(
+              equal(normalizer, array(0, normalizer.dtype()), stream()),
+              array(1, normalizer.dtype()),
+              normalizer,
+              stream());
           vjps.push_back(where(
-              equal(sliced_result, updates, stream()),
-              sliced_cotan,
+              update_matches,
+              divide(sliced_cotan, normalizer, stream()),
               array(0, cotan.dtype()),
               stream()));
           break;
@@ -5049,33 +5420,100 @@ std::vector<array> SliceUpdate::jvp(
   // Check inputs
   assert(primals.size() == 2);
 
-  if (argnums.size() != 2) {
-    throw std::runtime_error(
-        "[SliceUpdate] JVP for one argument not implemented yet.");
-  }
+  auto s = stream();
+  const auto& values = primals[0];
+  const auto& updates = primals[1];
 
-  auto result_tan = tangents[0];
+  auto tangent_for = [&](int arg, const array& primal) {
+    auto it = std::find(argnums.begin(), argnums.end(), arg);
+    if (it == argnums.end()) {
+      return zeros_like(primal, s);
+    }
+    return tangents[it - argnums.begin()];
+  };
+
+  auto values_tan = tangent_for(0, values);
+  auto updates_tan = tangent_for(1, updates);
 
   switch (reduce_type_) {
     case SliceUpdate::None:
       return {array(
-          result_tan.shape(),
-          result_tan.dtype(),
+          values_tan.shape(),
+          values_tan.dtype(),
           std::make_shared<SliceUpdate>(
               stream(), reduce_type_, start_indices_, end_indices_, strides_),
-          {result_tan, tangents[1]})};
+          {values_tan, updates_tan})};
     case SliceUpdate::Sum:
       return {array(
-          result_tan.shape(),
-          result_tan.dtype(),
+          values_tan.shape(),
+          values_tan.dtype(),
           std::make_shared<SliceUpdate>(
               stream(), reduce_type_, start_indices_, end_indices_, strides_),
-          {result_tan, tangents[1]})};
-    case SliceUpdate::Prod:
+          {values_tan, updates_tan})};
+    case SliceUpdate::Prod: {
+      auto sliced_values =
+          slice(values, start_indices_, end_indices_, strides_, stream());
+      auto sliced_values_tan =
+          slice(values_tan, start_indices_, end_indices_, strides_, stream());
+      auto sliced_tan = add(
+          multiply(sliced_values_tan, updates, stream()),
+          multiply(sliced_values, updates_tan, stream()),
+          stream());
+      return {slice_update(
+          values_tan,
+          sliced_tan,
+          start_indices_,
+          end_indices_,
+          strides_,
+          stream())};
+    }
     case SliceUpdate::Max:
     case SliceUpdate::Min: {
-      throw std::runtime_error(
-          "[SliceUpdate] JVP for product, minimum and maximum not implemented.");
+      auto result = array(
+          values.shape(),
+          values.dtype(),
+          std::make_shared<SliceUpdate>(
+              stream(), reduce_type_, start_indices_, end_indices_, strides_),
+          {values, updates});
+      auto sliced_result =
+          slice(result, start_indices_, end_indices_, strides_, stream());
+      auto sliced_values =
+          slice(values, start_indices_, end_indices_, strides_, stream());
+      auto sliced_values_tan =
+          slice(values_tan, start_indices_, end_indices_, strides_, stream());
+      auto source_matches = equal(sliced_values, sliced_result, stream());
+      auto update_matches = equal(updates, sliced_result, stream());
+      auto normalizer = add(
+          astype(source_matches, values_tan.dtype(), stream()),
+          astype(update_matches, values_tan.dtype(), stream()),
+          stream());
+      normalizer = where(
+          equal(normalizer, array(0, normalizer.dtype()), stream()),
+          array(1, normalizer.dtype()),
+          normalizer,
+          stream());
+      auto sliced_tan = divide(
+          add(
+              where(
+                  source_matches,
+                  sliced_values_tan,
+                  array(0, values_tan.dtype()),
+                  stream()),
+              where(
+                  update_matches,
+                  updates_tan,
+                  array(0, updates_tan.dtype()),
+                  stream()),
+              stream()),
+          normalizer,
+          stream());
+      return {slice_update(
+          values_tan,
+          sliced_tan,
+          start_indices_,
+          end_indices_,
+          strides_,
+          stream())};
     }
   }
 

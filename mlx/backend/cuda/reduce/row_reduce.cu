@@ -263,7 +263,10 @@ void row_reduce_simple(
 
       // Pick the kernel
       auto kernel = cu::row_reduce_simple<T, U, OP, N_READS>;
-      if (grid.x >= 1024) {
+      if (grid.x >= 4096) {
+        grid.x = (grid.x + 3) / 4;
+        kernel = cu::row_reduce_simple<T, U, OP, N_READS, 4>;
+      } else if (grid.x >= 1024) {
         grid.x = (grid.x + 1) / 2;
         kernel = cu::row_reduce_simple<T, U, OP, N_READS, 2>;
       }

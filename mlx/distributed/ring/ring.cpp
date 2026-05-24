@@ -6,12 +6,14 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <algorithm>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <list>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 
 #include <json.hpp>
@@ -342,6 +344,16 @@ std::vector<int> accept_connections(
   return sockets;
 }
 
+std::vector<int> accept_connections(
+    std::vector<detail::TCPSocket>&& listeners) {
+  std::vector<int> sockets;
+  sockets.reserve(listeners.size());
+  for (auto& socket : listeners) {
+    sockets.push_back(socket.accept(RING_TAG).detach());
+  }
+  return sockets;
+}
+
 /**
  * The counterpoint of `accept_connections`. Basically connect to each of the
  * provided addresses.
@@ -376,6 +388,93 @@ std::vector<int> make_connections(
   return sockets;
 }
 
+void set_port(detail::address_t& address, uint16_t port) {
+  if (address.addr.ss_family == AF_INET) {
+    reinterpret_cast<sockaddr_in*>(&address.addr)->sin_port = htons(port);
+  } else if (address.addr.ss_family == AF_INET6) {
+    reinterpret_cast<sockaddr_in6*>(&address.addr)->sin6_port = htons(port);
+  } else {
+    throw std::runtime_error("[ring] Unsupported socket family in hostfile.");
+  }
+}
+
+std::vector<detail::TCPSocket> make_split_listeners(
+    const std::vector<detail::address_t>& addresses,
+    std::vector<detail::address_t>& local_addresses) {
+  std::vector<detail::TCPSocket> listeners;
+  listeners.reserve(addresses.size());
+  local_addresses.reserve(addresses.size());
+  for (auto address : addresses) {
+    set_port(address, 0);
+    detail::TCPSocket socket(RING_TAG);
+    socket.listen(RING_TAG, address);
+    local_addresses.push_back(socket.local_address(RING_TAG));
+    listeners.push_back(std::move(socket));
+  }
+  return listeners;
+}
+
+class SingletonGroup : public GroupImpl {
+ public:
+  Stream communication_stream(StreamOrDevice s) override {
+    return to_stream(s, Device::cpu);
+  }
+
+  int rank() override {
+    return 0;
+  }
+
+  int size() override {
+    return 1;
+  }
+
+  std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
+    return std::make_shared<SingletonGroup>();
+  }
+
+  void all_sum(const array& input, array& output, Stream stream) override {
+    copy(input, output, stream);
+  }
+
+  void all_gather(const array& input, array& output, Stream stream) override {
+    copy(input, output, stream);
+  }
+
+  void send(const array&, int, Stream) override {
+    throw UnsupportedBackendError(
+        "[ring] send is not supported for a singleton group.");
+  }
+
+  void recv(array&, int, Stream) override {
+    throw UnsupportedBackendError(
+        "[ring] recv is not supported for a singleton group.");
+  }
+
+  void all_max(const array& input, array& output, Stream stream) override {
+    copy(input, output, stream);
+  }
+
+  void all_min(const array& input, array& output, Stream stream) override {
+    copy(input, output, stream);
+  }
+
+  void sum_scatter(const array& input, array& output, Stream stream) override {
+    copy(input, output, stream);
+  }
+
+ private:
+  void copy(const array& input, array& output, Stream stream) {
+    auto& encoder = cpu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    encoder.dispatch([input_ptr = input.data<char>(),
+                      output_ptr = output.data<char>(),
+                      nbytes = input.nbytes()]() {
+      std::memcpy(output_ptr, input_ptr, nbytes);
+    });
+  }
+};
+
 } // namespace
 
 class RingGroup : public GroupImpl {
@@ -384,27 +483,43 @@ class RingGroup : public GroupImpl {
       int rank,
       std::vector<std::vector<detail::address_t>> nodes,
       bool verbose)
-      : rank_(rank), verbose_(verbose), pool_(0) {
-    if (rank_ > 0 && rank_ >= nodes.size()) {
+      : RingGroup(rank, std::move(nodes), {}, verbose) {}
+
+  RingGroup(
+      int rank,
+      std::vector<std::vector<detail::address_t>> nodes,
+      std::vector<detail::TCPSocket> listeners,
+      bool verbose)
+      : rank_(rank), nodes_(std::move(nodes)), verbose_(verbose), pool_(0) {
+    if (rank_ > 0 && rank_ >= nodes_.size()) {
       throw std::runtime_error(
           "[ring] Rank cannot be larger than the size of the group");
     }
 
-    size_ = nodes.size();
+    size_ = nodes_.size();
     int connect_to = (rank_ + 1) % size_;
+
+    if (!listeners.empty() && listeners.size() != nodes_[rank_].size()) {
+      throw std::runtime_error(
+          "[ring] Split listener count does not match this rank's node count.");
+    }
 
     // We define the connection order by having the rank_ == size_ - 1 connect
     // first and accept after.
     if (rank_ < connect_to) {
       log_info(verbose_, "Rank", rank_, "accepting");
-      sockets_left_ = accept_connections(nodes[rank_]);
+      sockets_left_ = listeners.empty()
+          ? accept_connections(nodes_[rank_])
+          : accept_connections(std::move(listeners));
       log_info(verbose_, "Rank", rank_, "connecting to", connect_to);
-      sockets_right_ = make_connections(nodes[connect_to], verbose);
+      sockets_right_ = make_connections(nodes_[connect_to], verbose);
     } else {
       log_info(verbose_, "Rank", rank_, "connecting to", connect_to);
-      sockets_right_ = make_connections(nodes[connect_to], verbose);
+      sockets_right_ = make_connections(nodes_[connect_to], verbose);
       log_info(verbose_, "Rank", rank_, "accepting");
-      sockets_left_ = accept_connections(nodes[rank_]);
+      sockets_left_ = listeners.empty()
+          ? accept_connections(nodes_[rank_])
+          : accept_connections(std::move(listeners));
     }
 
     // Failure if we couldn't make right or left sockets
@@ -490,7 +605,87 @@ class RingGroup : public GroupImpl {
   }
 
   std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[ring] Group split not supported.");
+    struct SplitSpec {
+      int color;
+      int key;
+      int rank;
+      int socket_count;
+    };
+
+    SplitSpec local{color, key < 0 ? rank_ : key, rank_, static_cast<int>(
+                                                            nodes_[rank_].size())};
+    std::vector<SplitSpec> specs(size_);
+    all_gather_impl(
+        reinterpret_cast<const char*>(&local),
+        reinterpret_cast<char*>(specs.data()),
+        sizeof(SplitSpec),
+        sizeof(SplitSpec),
+        sockets_right_[0],
+        sockets_left_[0],
+        1);
+
+    int max_socket_count = 0;
+    for (const auto& spec : specs) {
+      max_socket_count = std::max(max_socket_count, spec.socket_count);
+    }
+    if (max_socket_count <= 0) {
+      throw std::runtime_error("[ring] Cannot split a group with no sockets.");
+    }
+
+    std::vector<detail::address_t> local_addresses;
+    auto listeners = make_split_listeners(nodes_[rank_], local_addresses);
+    std::vector<detail::address_t> padded_addresses(max_socket_count);
+    std::copy(
+        local_addresses.begin(),
+        local_addresses.end(),
+        padded_addresses.begin());
+
+    std::vector<detail::address_t> gathered_addresses(
+        size_ * max_socket_count);
+    all_gather_impl(
+        reinterpret_cast<const char*>(padded_addresses.data()),
+        reinterpret_cast<char*>(gathered_addresses.data()),
+        max_socket_count * sizeof(detail::address_t),
+        max_socket_count * sizeof(detail::address_t),
+        sockets_right_[0],
+        sockets_left_[0],
+        1);
+
+    std::vector<SplitSpec> members;
+    members.reserve(size_);
+    for (const auto& spec : specs) {
+      if (spec.color == color) {
+        members.push_back(spec);
+      }
+    }
+    std::stable_sort(members.begin(), members.end(), [](auto a, auto b) {
+      if (a.key == b.key) {
+        return a.rank < b.rank;
+      }
+      return a.key < b.key;
+    });
+
+    int child_rank = -1;
+    std::vector<std::vector<detail::address_t>> child_nodes;
+    child_nodes.reserve(members.size());
+    for (int i = 0; i < members.size(); ++i) {
+      const auto& member = members[i];
+      if (member.rank == rank_) {
+        child_rank = i;
+      }
+      auto begin = gathered_addresses.begin() +
+          member.rank * max_socket_count;
+      child_nodes.emplace_back(begin, begin + member.socket_count);
+    }
+
+    if (child_rank < 0) {
+      throw std::runtime_error("[ring] Could not find this rank after split.");
+    }
+    if (child_nodes.size() == 1) {
+      return std::make_shared<SingletonGroup>();
+    }
+    return std::make_shared<RingGroup>(
+        child_rank, std::move(child_nodes), std::move(listeners), verbose_);
   }
 
   void all_gather(const array& input, array& output, Stream stream) override {
@@ -546,7 +741,7 @@ class RingGroup : public GroupImpl {
             msg << "[ring] Send only supported to direct neighbors "
                 << "but tried to send to " << dst << " from " << rank_
                 << std::endl;
-            throw std::runtime_error(msg.str());
+            throw UnsupportedBackendError(msg.str());
           }
         });
   }
@@ -570,13 +765,14 @@ class RingGroup : public GroupImpl {
             msg << "[ring] Recv only supported from direct neighbors "
                 << "but tried to recv from " << src << " to " << rank_
                 << std::endl;
-            throw std::runtime_error(msg.str());
+            throw UnsupportedBackendError(msg.str());
           }
         });
   }
 
   void sum_scatter(const array& input, array& output, Stream stream) override {
-    throw std::runtime_error("[ring] sum_scatter not supported.");
+    SWITCH_TYPE(
+        output, reduce_scatter<T>(input, output, stream, detail::SumOp<T>()));
   }
 
  private:
@@ -652,6 +848,43 @@ class RingGroup : public GroupImpl {
       for (auto& f : all_sums) {
         f.wait();
       }
+    });
+  }
+
+  template <typename T, typename ReduceOp>
+  void reduce_scatter(
+      const array& input,
+      array& output,
+      Stream stream,
+      ReduceOp reduce_op) {
+    auto in_ptr = input.data<char>();
+    auto out_ptr = output.data<char>();
+    auto& encoder = cpu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    encoder.dispatch([in_ptr,
+                      out_ptr,
+                      input_size = input.size(),
+                      output_size = output.size(),
+                      this,
+                      reduce_op]() {
+      using StorageT =
+          std::conditional_t<std::is_same_v<T, bool>, unsigned char, T>;
+      std::vector<StorageT> reduced_storage(input_size);
+      auto* reduced = reinterpret_cast<T*>(reduced_storage.data());
+      std::memcpy(reduced, in_ptr, input_size * sizeof(T));
+      all_reduce_impl<T, ReduceOp>(
+          reinterpret_cast<T*>(buffers_.data()),
+          reduced,
+          input_size,
+          sockets_right_[0],
+          sockets_left_[0],
+          -1,
+          reduce_op);
+      std::memcpy(
+          out_ptr,
+          reduced + rank_ * output_size,
+          output_size * sizeof(T));
     });
   }
 
@@ -829,6 +1062,8 @@ class RingGroup : public GroupImpl {
   int rank_;
   int size_;
 
+  std::vector<std::vector<detail::address_t>> nodes_;
+
   bool verbose_;
 
   ThreadPool pool_;
@@ -856,7 +1091,7 @@ std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
           << "and a hostfile (MLX_HOSTFILE) but provided MLX_RANK=\""
           << ((rank_str) ? rank_str : "") << "\" and MLX_HOSTFILE=\""
           << ((hostfile) ? hostfile : "") << "\"";
-      throw std::runtime_error(msg.str());
+      throw UnsupportedBackendError(msg.str());
     }
     return nullptr;
   }
