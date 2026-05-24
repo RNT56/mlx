@@ -183,6 +183,65 @@ struct ColReduceArgs {
   }
 };
 
+struct GeneralReduceArgs {
+  Shape shape;
+  Strides strides;
+  int ndim;
+
+  Shape reduce_shape;
+  Strides reduce_strides;
+  int reduce_ndim;
+
+  size_t reductions;
+
+  GeneralReduceArgs(
+      const array& in,
+      const ReductionPlan& plan,
+      const std::vector<int>& axes) {
+    std::tie(shape, strides) = shapes_without_reduction_axes(in, axes);
+    std::tie(shape, strides) = collapse_contiguous_dims(shape, strides);
+    ndim = shape.size();
+
+    reduce_shape = plan.shape;
+    reduce_strides = plan.strides;
+    reduce_ndim = reduce_shape.size();
+
+    reductions = 1;
+    for (auto s : reduce_shape) {
+      reductions *= s;
+    }
+  }
+
+  void encode(CommandEncoder& compute_encoder) {
+    // Push 0s to avoid encoding empty vectors.
+    if (reduce_ndim == 0) {
+      reduce_shape.push_back(0);
+      reduce_strides.push_back(0);
+    }
+    if (ndim == 0) {
+      shape.push_back(0);
+      strides.push_back(0);
+    }
+
+    compute_encoder.set_bytes(reductions, 2);
+    compute_encoder.set_vector_bytes(shape, 3);
+    compute_encoder.set_vector_bytes(strides, 4);
+    compute_encoder.set_bytes(ndim, 5);
+    compute_encoder.set_vector_bytes(reduce_shape, 6);
+    compute_encoder.set_vector_bytes(reduce_strides, 7);
+    compute_encoder.set_bytes(reduce_ndim, 8);
+
+    if (reduce_ndim == 0) {
+      reduce_shape.pop_back();
+      reduce_strides.pop_back();
+    }
+    if (ndim == 0) {
+      shape.pop_back();
+      strides.pop_back();
+    }
+  }
+};
+
 } // namespace
 
 inline auto safe_div(size_t n, size_t m) {
@@ -948,6 +1007,53 @@ void strided_reduce_general_dispatch(
   return strided_reduce_looped(in, out, op_name, args, compute_encoder, d, s);
 }
 
+void general_reduce_dispatch(
+    const array& in,
+    array& out,
+    const std::string& op_name,
+    const ReductionPlan& plan,
+    const std::vector<int>& axes,
+    CommandEncoder& compute_encoder,
+    metal::Device& d,
+    const Stream& s) {
+  GeneralReduceArgs args(in, plan, axes);
+
+  auto [in_type, out_type] = remap_reduce_types(in, op_name);
+  int n = get_kernel_reduce_ndim(args.reduce_ndim);
+  const std::string func_name = "general_reduce_looped";
+  std::string kname = func_name;
+  bool large = in.size() > INT32_MAX;
+  if (large) {
+    kname += "_large";
+  }
+  concatenate(
+      kname,
+      "_",
+      std::to_string(n),
+      "_reduce_",
+      op_name,
+      type_to_name(in_type));
+  auto kernel = get_reduce_kernel(
+      d,
+      kname,
+      func_name,
+      op_name,
+      in_type,
+      out_type,
+      large ? "int64_t" : "int",
+      n);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  auto out_grid_size = get_2d_grid_dims(out.shape(), out.strides());
+  MTL::Size grid_dims(32, out_grid_size.width, out_grid_size.height);
+  MTL::Size group_dims(32, 1, 1);
+
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_output_array(out, 1);
+  args.encode(compute_encoder);
+  compute_encoder.dispatch_threads(grid_dims, group_dims);
+}
+
 void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   array in = inputs[0];
@@ -992,22 +1098,16 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (in.size() > 0) {
     ReductionPlan plan = get_reduction_plan(in, axes_);
 
-    // If it is a general reduce then copy the input to a contiguous array and
-    // recompute the plan.
-    //
-    // TODO: This can be avoided by making the output have the same strides as
-    //       input for the axes with stride smaller than the minimum reduction
-    //       stride.
+    // Fully general strided reductions can be reduced directly. This avoids
+    // materializing large contiguous copies for transposed or expanded inputs.
     if (plan.type == GeneralReduce) {
-      array in_copy = contiguous_copy_gpu(in, s);
-      compute_encoder.add_temporary(in_copy);
-      in = in_copy;
-      plan = get_reduction_plan(in, axes_);
+      general_reduce_dispatch(
+          in, out, op_name, plan, axes_, compute_encoder, d, s);
     }
 
     // Reducing over everything and the data is all there no broadcasting or
     // slicing etc.
-    if (plan.type == ContiguousAllReduce) {
+    else if (plan.type == ContiguousAllReduce) {
       all_reduce_dispatch(in, out, op_name, compute_encoder, d, s);
     }
 

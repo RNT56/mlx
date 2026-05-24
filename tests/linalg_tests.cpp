@@ -413,6 +413,14 @@ TEST_CASE("test matrix cholesky") {
             .item<bool>());
   CHECK(allclose(matmul(transpose(U), U), A, /* rtol = */ 0, /* atol = */ 1e-6)
             .item<bool>());
+
+  auto non_psd = array({1.0f, 2.0f, 2.0f, 1.0f}, {2, 2});
+  auto bad = linalg::cholesky(non_psd, /* upper = */ false, Device::cpu);
+  CHECK_THROWS_AS(eval(bad), std::runtime_error);
+
+  // CPU worker exceptions should be recoverable after being reported.
+  auto recovered = linalg::cholesky(eye(2), /* upper = */ false, Device::cpu);
+  CHECK_NOTHROW(eval(recovered));
 }
 
 TEST_CASE("test matrix pseudo-inverse") {

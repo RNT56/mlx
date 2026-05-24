@@ -390,9 +390,11 @@ void init_array(nb::module_& m) {
           "__array_namespace__",
           [](const mx::array& a,
              const std::optional<std::string>& api_version) {
-            if (api_version) {
+            if (api_version && *api_version != "2022.12" &&
+                *api_version != "2023.12") {
               throw std::invalid_argument(
-                  "Explicitly specifying api_version is not yet implemented.");
+                  "Unsupported array API version '" + *api_version +
+                  "'. Supported versions are '2022.12' and '2023.12'.");
             }
             return nb::module_::import_("mlx.core");
           },
