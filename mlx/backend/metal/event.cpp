@@ -25,11 +25,19 @@ void Event::wait() {
            ->waitUntilSignaledValue(value(), -1)) {
     throw std::runtime_error("[Event::wait] Timed out");
   }
+  if (stream_.device == Device::cpu) {
+    if (auto exception = scheduler::take_exception(stream_)) {
+      std::rethrow_exception(exception);
+    }
+  }
 }
 
 void Event::wait(Stream stream) {
   if (stream.device == Device::cpu) {
-    scheduler::enqueue(stream, [*this]() mutable { wait(); });
+    scheduler::enqueue(stream, [*this]() mutable {
+      static_cast<MTL::SharedEvent*>(event_.get())
+          ->waitUntilSignaledValue(value(), -1);
+    });
   } else {
     auto& encoder = metal::get_command_encoder(stream);
     encoder.end_encoding();

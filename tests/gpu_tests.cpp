@@ -3,6 +3,7 @@
 #include <array>
 
 #include "doctest/doctest.h"
+#include "mlx/backend/common/reduce.h"
 #include "mlx/mlx.h"
 
 using namespace mlx::core;
@@ -191,6 +192,17 @@ TEST_CASE("test gpu reduce with axes") {
       auto out_cpu = sum(a, {0, 1, ax}, false, Device::cpu);
       CHECK(array_equal(out_gpu, out_cpu, Device::cpu).item<bool>());
     }
+  }
+
+  {
+    auto a = reshape(arange(24, float32, Device::gpu), {2, 3, 4});
+    a = transpose(a, {2, 0, 1});
+    eval(a);
+    CHECK_EQ(get_reduction_plan(a, {1}).type, GeneralReduce);
+
+    auto out_gpu = sum(a, 1, false, Device::gpu);
+    auto out_cpu = sum(a, 1, false, Device::cpu);
+    CHECK(array_equal(out_gpu, out_cpu, Device::cpu).item<bool>());
   }
 }
 

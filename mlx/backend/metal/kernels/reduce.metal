@@ -92,6 +92,19 @@ instantiate_init_min_max(max, Max)
   instantiate_col_reduce_looped(name, itype, otype, op, 2)     \
   instantiate_col_reduce_looped(name, itype, otype, op, 5)
 
+#define instantiate_general_reduce_looped(name, itype, otype, op, dim)     \
+  instantiate_kernel("general_reduce_looped_" #dim "_reduce_" #name,       \
+                     general_reduce_looped,                                \
+                     itype, otype, op, int, dim)                           \
+  instantiate_kernel("general_reduce_looped_large_" #dim "_reduce_" #name, \
+                     general_reduce_looped,                                \
+                     itype, otype, op, int64_t, dim)
+
+#define instantiate_general_reduce(name, itype, otype, op) \
+  instantiate_general_reduce_looped(name, itype, otype, op, 1) \
+  instantiate_general_reduce_looped(name, itype, otype, op, 2) \
+  instantiate_general_reduce_looped(name, itype, otype, op, 5)
+
 #define instantiate_row_reduce_small(name, itype, otype, op, dim)     \
   instantiate_kernel("row_reduce_small_" #dim "_reduce_" #name,       \
                      row_reduce_small,                                \
@@ -122,7 +135,8 @@ instantiate_init_min_max(max, Max)
 #define instantiate_reduce_functions(name, tname, itype, otype, op)    \
   instantiate_all_reduce(name##tname, itype, otype, op<otype>)         \
   instantiate_row_reduce_general(name##tname, itype, otype, op<otype>) \
-  instantiate_col_reduce_general(name##tname, itype, otype, op<otype>)
+  instantiate_col_reduce_general(name##tname, itype, otype, op<otype>) \
+  instantiate_general_reduce(name##tname, itype, otype, op<otype>)
 
 #define instantiate_and_or(name, op)                           \
   instantiate_reduce_functions(name, bool_, bool, bool, op)    \
