@@ -21,15 +21,25 @@ Event::Event(Stream stream) : stream_(stream) {
 
 void Event::wait() {
   auto ec = static_cast<EventCounter*>(event_.get());
-  std::unique_lock<std::mutex> lk(ec->mtx);
-  if (ec->value >= value()) {
-    return;
+  {
+    std::unique_lock<std::mutex> lk(ec->mtx);
+    if (ec->value < value()) {
+      ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
+    }
   }
-  ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
+  if (auto exception = scheduler::take_exception(stream_)) {
+    std::rethrow_exception(exception);
+  }
 }
 
 void Event::wait(Stream stream) {
-  scheduler::enqueue(stream, [*this]() mutable { wait(); });
+  scheduler::enqueue(stream, [*this]() mutable {
+    auto ec = static_cast<EventCounter*>(event_.get());
+    std::unique_lock<std::mutex> lk(ec->mtx);
+    if (ec->value < value()) {
+      ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
+    }
+  });
 }
 
 void Event::signal(Stream stream) {

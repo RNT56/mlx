@@ -1,6 +1,7 @@
 // Copyright © 2023 Apple Inc.
 
 #include <cassert>
+#include <type_traits>
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/cpu/binary_ops.h"
@@ -12,6 +13,102 @@
 namespace mlx::core {
 
 namespace {
+
+struct ScanSum {
+  static constexpr bool vectorizable = true;
+
+  template <typename U, typename T>
+  auto operator()(U y, T x) const {
+    return y + x;
+  }
+
+  template <int N, typename T>
+  simd::Simd<T, N> operator()(simd::Simd<T, N> y, simd::Simd<T, N> x) const {
+    return y + x;
+  }
+};
+
+struct ScanProd {
+  static constexpr bool vectorizable = true;
+
+  template <typename U, typename T>
+  auto operator()(U y, T x) const {
+    return y * x;
+  }
+
+  template <int N, typename T>
+  simd::Simd<T, N> operator()(simd::Simd<T, N> y, simd::Simd<T, N> x) const {
+    return y * x;
+  }
+};
+
+struct ScanMin {
+  static constexpr bool vectorizable = true;
+
+  template <typename U, typename T>
+  auto operator()(U y, T x) const {
+    return x < y ? x : y;
+  }
+
+  template <int N, typename T>
+  simd::Simd<T, N> operator()(simd::Simd<T, N> y, simd::Simd<T, N> x) const {
+    return simd::select(x < y, x, y);
+  }
+};
+
+struct ScanMax {
+  static constexpr bool vectorizable = true;
+
+  template <typename U, typename T>
+  auto operator()(U y, T x) const {
+    return x < y ? y : x;
+  }
+
+  template <int N, typename T>
+  simd::Simd<T, N> operator()(simd::Simd<T, N> y, simd::Simd<T, N> x) const {
+    return simd::select(x < y, y, x);
+  }
+};
+
+struct ScanLogAddExp {
+  static constexpr bool vectorizable = false;
+
+  template <typename U, typename T>
+  auto operator()(U y, T x) const {
+    return detail::LogAddExp{}(y, static_cast<U>(x));
+  }
+
+  template <int N, typename T>
+  simd::Simd<T, N> operator()(simd::Simd<T, N> y, simd::Simd<T, N> x) const {
+    return detail::LogAddExp{}(y, x);
+  }
+};
+
+template <typename T, typename U, typename Op>
+void strided_scan_step(
+    const U* previous,
+    const T* input,
+    U* output,
+    int stride,
+    const Op& op) {
+  if constexpr (
+      Op::vectorizable && std::is_same_v<T, U> &&
+      !std::is_same_v<U, bool>) {
+    constexpr int N = simd::max_size<U>;
+    while (stride >= N) {
+      simd::store(
+          output,
+          op(simd::load<U, N>(previous), simd::load<T, N>(input)));
+      previous += N;
+      input += N;
+      output += N;
+      stride -= N;
+    }
+  }
+  while (stride-- > 0) {
+    *output++ = op(*previous++, *input++);
+  }
+}
 
 template <typename T, typename U, typename Op>
 void contiguous_scan(
@@ -89,7 +186,6 @@ void strided_scan(
     bool inclusive,
     const Op& op,
     U init) {
-  // TODO: Vectorize the following naive implementation
   if (!reverse) {
     if (inclusive) {
       for (int i = 0; i < count; i++) {
@@ -97,11 +193,9 @@ void strided_scan(
         output += stride;
         input += stride;
         for (int j = 1; j < size; j++) {
-          for (int k = 0; k < stride; k++) {
-            *output = op(*(output - stride), *input);
-            output++;
-            input++;
-          }
+          strided_scan_step(output - stride, input, output, stride, op);
+          output += stride;
+          input += stride;
         }
       }
     } else {
@@ -110,41 +204,41 @@ void strided_scan(
         output += stride;
         input += stride;
         for (int j = 1; j < size; j++) {
-          for (int k = 0; k < stride; k++) {
-            *output = op(*(output - stride), *(input - stride));
-            output++;
-            input++;
-          }
+          strided_scan_step(output - stride, input - stride, output, stride, op);
+          output += stride;
+          input += stride;
         }
       }
     }
   } else {
     if (inclusive) {
       for (int i = 0; i < count; i++) {
-        output += (size - 1) * stride;
-        input += (size - 1) * stride;
-        std::copy(input, input + stride, output);
+        auto input_block = input + (size - 1) * stride;
+        auto output_block = output + (size - 1) * stride;
+        std::copy(input_block, input_block + stride, output_block);
         for (int j = 1; j < size; j++) {
-          for (int k = 0; k < stride; k++) {
-            output--;
-            input--;
-            *output = op(*(output + stride), *input);
-          }
+          input_block -= stride;
+          output_block -= stride;
+          strided_scan_step(
+              output_block + stride, input_block, output_block, stride, op);
         }
         output += size * stride;
         input += size * stride;
       }
     } else {
       for (int i = 0; i < count; i++) {
-        output += (size - 1) * stride;
-        input += (size - 1) * stride;
-        std::fill(output, output + stride, init);
+        auto input_block = input + (size - 1) * stride;
+        auto output_block = output + (size - 1) * stride;
+        std::fill(output_block, output_block + stride, init);
         for (int j = 1; j < size; j++) {
-          for (int k = 0; k < stride; k++) {
-            output--;
-            input--;
-            *output = op(*(output + stride), *(input + stride));
-          }
+          input_block -= stride;
+          output_block -= stride;
+          strided_scan_step(
+              output_block + stride,
+              input_block + stride,
+              output_block,
+              stride,
+              op);
         }
         output += size * stride;
         input += size * stride;
@@ -200,41 +294,34 @@ void scan_dispatch(
     bool inclusive) {
   switch (rtype) {
     case Scan::Sum: {
-      auto op = [](U y, T x) { return y + x; };
       auto init = static_cast<U>(0);
-      scan_op<T, U>(in, out, axis, reverse, inclusive, op, init);
+      scan_op<T, U>(in, out, axis, reverse, inclusive, ScanSum{}, init);
       break;
     }
     case Scan::Prod: {
-      auto op = [](U y, T x) { return y * x; };
       auto init = static_cast<U>(1);
-      scan_op<T, U>(in, out, axis, reverse, inclusive, op, init);
+      scan_op<T, U>(in, out, axis, reverse, inclusive, ScanProd{}, init);
       break;
     }
     case Scan::Min: {
-      auto op = [](U y, T x) { return x < y ? x : y; };
       auto init = (issubdtype(in.dtype(), floating))
           ? static_cast<U>(std::numeric_limits<float>::infinity())
           : std::numeric_limits<U>::max();
-      scan_op<T, U>(in, out, axis, reverse, inclusive, op, init);
+      scan_op<T, U>(in, out, axis, reverse, inclusive, ScanMin{}, init);
       break;
     }
     case Scan::Max: {
-      auto op = [](U y, T x) { return x < y ? y : x; };
       auto init = (issubdtype(in.dtype(), floating))
           ? static_cast<U>(-std::numeric_limits<float>::infinity())
           : std::numeric_limits<U>::min();
-      scan_op<T, U>(in, out, axis, reverse, inclusive, op, init);
+      scan_op<T, U>(in, out, axis, reverse, inclusive, ScanMax{}, init);
       break;
     }
     case Scan::LogAddExp: {
-      auto op = [](U a, T b) {
-        return detail::LogAddExp{}(a, static_cast<U>(b));
-      };
       auto init = (issubdtype(in.dtype(), floating))
           ? static_cast<U>(-std::numeric_limits<float>::infinity())
           : std::numeric_limits<U>::min();
-      scan_op<T, U>(in, out, axis, reverse, inclusive, op, init);
+      scan_op<T, U>(in, out, axis, reverse, inclusive, ScanLogAddExp{}, init);
       break;
     }
   }

@@ -2809,6 +2809,20 @@ TEST_CASE("test scan op") {
   y = vmap(fun, 1, 1)(x);
   expected = array({1.0f, 2.0f, 4.0f, 6.0f, 9.0f, 12.0f, 16.0f, 20.0f}, {4, 2});
   CHECK(array_equal(y, expected).item<bool>());
+
+  x = array({2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}, {2, 3});
+  y = cumprod(x, 0, false, true);
+  expected = array({2.0f, 3.0f, 4.0f, 10.0f, 18.0f, 28.0f}, {2, 3});
+  CHECK(array_equal(y, expected).item<bool>());
+
+  x = array({3.0f, -2.0f, 5.0f, 1.0f, 4.0f, -6.0f}, {2, 3});
+  y = cummin(x, 0, false, true);
+  expected = array({3.0f, -2.0f, 5.0f, 1.0f, -2.0f, -6.0f}, {2, 3});
+  CHECK(array_equal(y, expected).item<bool>());
+
+  y = cummax(x, 0, true, false);
+  expected = array({1.0f, 4.0f, -6.0f, -INFINITY, -INFINITY, -INFINITY}, {2, 3});
+  CHECK(array_equal(y, expected).item<bool>());
 }
 
 TEST_CASE("test pad") {

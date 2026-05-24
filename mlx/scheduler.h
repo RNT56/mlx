@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <exception>
 #include <future>
 #include <queue>
 #include <shared_mutex>
@@ -93,6 +94,25 @@ class MLX_API Scheduler {
     completion_cv.notify_all();
   }
 
+  void record_exception(const Stream& stream, std::exception_ptr exception) {
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      stream_exceptions_.try_emplace(stream.index, std::move(exception));
+    }
+    completion_cv.notify_all();
+  }
+
+  std::exception_ptr take_exception(const Stream& stream) {
+    std::lock_guard<std::mutex> lk(mtx);
+    auto it = stream_exceptions_.find(stream.index);
+    if (it == stream_exceptions_.end()) {
+      return nullptr;
+    }
+    auto exception = std::move(it->second);
+    stream_exceptions_.erase(it);
+    return exception;
+  }
+
   int n_active_tasks() const {
     return n_active_tasks_;
   }
@@ -111,6 +131,7 @@ class MLX_API Scheduler {
   friend Stream mlx::core::new_stream(Device d);
 
   int n_active_tasks_{0};
+  std::unordered_map<int, std::exception_ptr> stream_exceptions_;
   std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
   std::shared_mutex threads_mtx_;
   std::condition_variable completion_cv;
@@ -134,6 +155,16 @@ inline void notify_new_task(const Stream& stream) {
 
 inline void notify_task_completion(const Stream& stream) {
   scheduler().notify_task_completion(stream);
+}
+
+inline void record_exception(
+    const Stream& stream,
+    std::exception_ptr exception) {
+  scheduler().record_exception(stream, std::move(exception));
+}
+
+inline std::exception_ptr take_exception(const Stream& stream) {
+  return scheduler().take_exception(stream);
 }
 
 inline void wait_for_one() {
