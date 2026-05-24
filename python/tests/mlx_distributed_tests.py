@@ -92,6 +92,45 @@ class MLXDistributedCommonTestCase(mlx_tests.MLXTestCase):
                 z = x.min(0)
                 self.assertTrue(mx.all(y == z))
 
+    def test_sum_scatter(self):
+        g = mx.distributed.init()
+        dtypes = [
+            (mx.int8, 0),
+            (mx.uint8, 0),
+            (mx.int32, 0),
+            (mx.uint32, 0),
+            (mx.float32, 1e-6),
+            (mx.float16, 5e-3),
+            (mx.bfloat16, 1e-1),
+        ]
+        sizes = [
+            (g.size() * 2,),
+            (g.size() * 4, 3),
+            (g.size() * 128,),
+        ]
+        key = mx.random.key(g.rank())
+
+        for dt, rtol in dtypes:
+            for sh in sizes:
+                x = (mx.random.uniform(shape=sh, key=key) * 10).astype(dt)
+                y = mx.distributed.sum_scatter(x, group=g)
+                z = mx.distributed.all_sum(x, group=g)
+                chunk = sh[0] // g.size()
+                z = z[g.rank() * chunk : (g.rank() + 1) * chunk]
+                maxrelerror = (y - z).abs()
+                if rtol > 0:
+                    maxrelerror /= z.abs()
+                maxrelerror = maxrelerror.max()
+                self.assertLessEqual(maxrelerror, rtol)
+
+    def test_unavailable_backend_error_type(self):
+        for backend in ("nccl", "mpi", "ring", "jaccl"):
+            if not mx.distributed.is_available(backend):
+                with self.assertRaises(mx.distributed.UnsupportedBackendError):
+                    mx.distributed.init(strict=True, backend=backend)
+                return
+        self.skipTest("all distributed backends are available in this build")
+
     def test_donation(self):
         x = mx.random.normal((1024,))
         mx.eval(x)

@@ -45,6 +45,8 @@ class TCPSocket {
   void send(const char* tag, const void* data, size_t len);
   void recv(const char* tag, void* data, size_t len);
 
+  address_t local_address(const char* tag) const;
+
   int detach();
 
   operator int() const {

@@ -116,6 +116,27 @@ class TestNCCLDistributed(mlx_distributed_tests.MLXDistributedCommonTestCase):
             self.assertEqual(y.shape, (sub.size() * 2, 2, 4))
             self.assertTrue(mx.all(y == 1))
 
+    def test_send_recv(self):
+        world = mx.distributed.init()
+        pairs = world.split(world.rank() // 2)
+        neighbor = (pairs.rank() + 1) % 2
+        x = mx.ones((16,), dtype=mx.float32) * (world.rank() + 1)
+
+        if pairs.rank() == 0:
+            sent = mx.distributed.send(x, neighbor, group=pairs)
+            mx.eval(sent)
+            received = mx.distributed.recv_like(x, neighbor, group=pairs)
+            mx.eval(received)
+            self.assertTrue(mx.all(sent == x))
+            self.assertTrue(mx.all(received == x + 1))
+        else:
+            received = mx.distributed.recv_like(x, neighbor, group=pairs)
+            mx.eval(received)
+            sent = mx.distributed.send(x, neighbor, group=pairs)
+            mx.eval(sent)
+            self.assertTrue(mx.all(sent == x))
+            self.assertTrue(mx.all(received == x - 1))
+
     def test_fsdp_apply_gradients(self):
         world = mx.distributed.init()
         N = world.size()

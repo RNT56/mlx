@@ -347,6 +347,13 @@ class TestAutograd(mlx_tests.MLXTestCase):
         self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 0.0, 6.0, 0.0])))
         self.assertTrue(mx.allclose(vjps[1], mx.array([5.0, 7.0])))
 
+        updates = mx.array([2.0, 4.0])
+        _, vjps = mx.vjp(fun, [mx.array([1.0, 2.0, 3.0, 4.0]), updates], [cotan])
+        mx.eval(vjps)
+
+        self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 2.5, 6.0, 3.5])))
+        self.assertTrue(mx.allclose(vjps[1], mx.array([2.5, 3.5])))
+
     def test_scatter_min_vjp(self):
         def fun(src, updates):
             x = src.at[mx.array([1, 3])].minimum(updates)
@@ -366,6 +373,50 @@ class TestAutograd(mlx_tests.MLXTestCase):
 
         self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 0.0, 6.0, 0.0])))
         self.assertTrue(mx.allclose(vjps[1], mx.array([5.0, 7.0])))
+
+        updates = mx.array([2.0, 4.0])
+        _, vjps = mx.vjp(fun, [mx.array([1.0, 2.0, 3.0, 4.0]), updates], [cotan])
+        mx.eval(vjps)
+
+        self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 2.5, 6.0, 3.5])))
+        self.assertTrue(mx.allclose(vjps[1], mx.array([2.5, 3.5])))
+
+    def test_scatter_multiply_vjp_and_jvp(self):
+        idx = mx.array([1, 3])
+
+        def fun(src, updates):
+            return src.at[idx].multiply(updates)
+
+        src = mx.array([1.0, 2.0, 3.0, 4.0])
+        updates = mx.array([5.0, 6.0])
+        cotan = mx.array([2.0, 3.0, 4.0, 5.0])
+        _, vjps = mx.vjp(fun, [src, updates], [cotan])
+        mx.eval(vjps)
+
+        self.assertTrue(mx.allclose(vjps[0], mx.array([2.0, 15.0, 4.0, 30.0])))
+        self.assertTrue(mx.allclose(vjps[1], mx.array([6.0, 20.0])))
+
+        src_tan = mx.array([10.0, 20.0, 30.0, 40.0])
+        update_tan = mx.array([50.0, 60.0])
+        _, jvps = mx.jvp(fun, [src, updates], [src_tan, update_tan])
+        mx.eval(jvps)
+
+        self.assertTrue(mx.allclose(jvps[0], mx.array([10.0, 200.0, 30.0, 480.0])))
+
+    def test_scatter_max_jvp_ties(self):
+        idx = mx.array([1, 2])
+
+        def fun(src, updates):
+            return src.at[idx].maximum(updates)
+
+        src = mx.array([1.0, 2.0, 2.0, 4.0])
+        updates = mx.array([2.0, 5.0])
+        src_tan = mx.array([10.0, 20.0, 30.0, 40.0])
+        update_tan = mx.array([50.0, 60.0])
+        _, jvps = mx.jvp(fun, [src, updates], [src_tan, update_tan])
+        mx.eval(jvps)
+
+        self.assertTrue(mx.allclose(jvps[0], mx.array([10.0, 35.0, 60.0, 40.0])))
 
     def test_slice_update_max_vjp(self):
         def fun(src, updates):
@@ -387,6 +438,13 @@ class TestAutograd(mlx_tests.MLXTestCase):
         self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 0.0, 0.0, 7.0])))
         self.assertTrue(mx.allclose(vjps[1], mx.array([[5.0, 6.0]])))
 
+        updates = mx.array([[2.0, 3.0]])
+        _, vjps = mx.vjp(fun, [mx.array([1.0, 2.0, 3.0, 4.0]), updates], [cotan])
+        mx.eval(vjps)
+
+        self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 2.5, 3.0, 7.0])))
+        self.assertTrue(mx.allclose(vjps[1], mx.array([[2.5, 3.0]])))
+
     def test_slice_update_min_vjp(self):
         def fun(src, updates):
             x = src.at[1:3].minimum(updates)
@@ -406,6 +464,13 @@ class TestAutograd(mlx_tests.MLXTestCase):
 
         self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 0.0, 0.0, 7.0])))
         self.assertTrue(mx.allclose(vjps[1], mx.array([[5.0, 6.0]])))
+
+        updates = mx.array([[2.0, 3.0]])
+        _, vjps = mx.vjp(fun, [mx.array([1.0, 2.0, 3.0, 4.0]), updates], [cotan])
+        mx.eval(vjps)
+
+        self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 2.5, 3.0, 7.0])))
+        self.assertTrue(mx.allclose(vjps[1], mx.array([[2.5, 3.0]])))
 
     def test_slice_update_add_vjp(self):
         def fun(src, updates):
@@ -432,6 +497,28 @@ class TestAutograd(mlx_tests.MLXTestCase):
 
         self.assertTrue(mx.allclose(vjps[0], mx.array([4.0, 10.0, 18.0, 7.0])))
         self.assertTrue(mx.allclose(vjps[1], mx.array([[10.0, 18.0]])))
+
+    def test_slice_update_multiply_and_max_jvp(self):
+        def multiply_fun(src, updates):
+            return src.at[1:3].multiply(updates)
+
+        src = mx.array([1.0, 2.0, 3.0, 4.0])
+        updates = mx.array([[5.0, 6.0]])
+        src_tan = mx.array([10.0, 20.0, 30.0, 40.0])
+        update_tan = mx.array([[50.0, 60.0]])
+        _, jvps = mx.jvp(multiply_fun, [src, updates], [src_tan, update_tan])
+        mx.eval(jvps)
+
+        self.assertTrue(mx.allclose(jvps[0], mx.array([10.0, 200.0, 360.0, 40.0])))
+
+        def maximum_fun(src, updates):
+            return src.at[1:3].maximum(updates)
+
+        updates = mx.array([[2.0, 5.0]])
+        _, jvps = mx.jvp(maximum_fun, [src, updates], [src_tan, update_tan])
+        mx.eval(jvps)
+
+        self.assertTrue(mx.allclose(jvps[0], mx.array([10.0, 35.0, 60.0, 40.0])))
 
     def test_split_against_slice(self):
         def f_split(x):
@@ -589,6 +676,79 @@ class TestAutograd(mlx_tests.MLXTestCase):
         out = mx.grad(fun)(y)
         expected = mx.array([0.0, 0.0, 0.0, 9.0, 1.0])
         self.assertTrue(mx.allclose(out, expected))
+
+    def test_cumprod_jvp(self):
+        def fun(y):
+            return mx.cumprod(y)
+
+        y = mx.array([2.0, 1.0, 2.0, 2.0, 3.0])
+        tan = mx.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        _, out = mx.jvp(fun, [y], [tan])
+        expected = mx.array([1.0, 5.0, 16.0, 48.0, 224.0])
+        self.assertTrue(mx.allclose(out[0], expected))
+
+        y = mx.array([2.0, 0.0, 2.0, 0.0, 3.0])
+        _, out = mx.jvp(fun, [y], [tan])
+        expected = mx.array([1.0, 4.0, 8.0, 0.0, 0.0])
+        self.assertTrue(mx.allclose(out[0], expected))
+
+    def test_cummin_cummax_vjp_and_jvp(self):
+        x = mx.array([2.0, 1.0, 1.0, 3.0])
+        tan = mx.array([10.0, 20.0, 30.0, 40.0])
+        cotan = mx.array([1.0, 2.0, 3.0, 4.0])
+
+        _, jvps = mx.jvp(mx.cummin, [x], [tan])
+        self.assertTrue(mx.allclose(jvps[0], mx.array([10.0, 20.0, 25.0, 25.0])))
+
+        _, vjps = mx.vjp(mx.cummin, [x], [cotan])
+        self.assertTrue(mx.allclose(vjps[0], mx.array([1.0, 5.5, 3.5, 0.0])))
+
+        x = mx.array([2.0, 1.0, 2.0, 3.0])
+        _, jvps = mx.jvp(mx.cummax, [x], [tan])
+        self.assertTrue(mx.allclose(jvps[0], mx.array([10.0, 10.0, 20.0, 40.0])))
+
+        _, vjps = mx.vjp(mx.cummax, [x], [cotan])
+        self.assertTrue(mx.allclose(vjps[0], mx.array([4.5, 0.0, 1.5, 4.0])))
+
+    def test_worker1_autograd_finite_difference(self):
+        def finite_difference(fn, values, eps=1e-3):
+            grad = []
+            for i in range(len(values)):
+                plus = list(values)
+                minus = list(values)
+                plus[i] += eps
+                minus[i] -= eps
+                grad.append((fn(mx.array(plus)).item() - fn(mx.array(minus)).item()) / (2 * eps))
+            return mx.array(grad)
+
+        def cumprod_loss(x):
+            return mx.cumprod(x).sum()
+
+        values = [1.5, 2.0, 3.0]
+        analytic = mx.grad(cumprod_loss)(mx.array(values))
+        numeric = finite_difference(cumprod_loss, values)
+        self.assertTrue(mx.allclose(analytic, numeric, atol=1e-2, rtol=1e-2))
+
+        idx = mx.array([1, 3])
+        updates = mx.array([5.0, 6.0])
+
+        def scatter_prod_src_loss(src):
+            return src.at[idx].multiply(updates).sum()
+
+        values = [1.0, 2.0, 3.0, 4.0]
+        analytic = mx.grad(scatter_prod_src_loss)(mx.array(values))
+        numeric = finite_difference(scatter_prod_src_loss, values)
+        self.assertTrue(mx.allclose(analytic, numeric, atol=1e-2, rtol=1e-2))
+
+        src = mx.array([1.0, 2.0, 3.0, 4.0])
+
+        def slice_prod_update_loss(updates):
+            return src.at[1:3].multiply(updates).sum()
+
+        values = [5.0, 6.0]
+        analytic = mx.grad(slice_prod_update_loss)(mx.array(values))
+        numeric = finite_difference(slice_prod_update_loss, values)
+        self.assertTrue(mx.allclose(analytic, numeric, atol=1e-2, rtol=1e-2))
 
     def test_topk_grad(self):
         a = mx.array([[1, 2, 6, 4, 5], [9, 5, 6, 7, 8]], mx.float32)

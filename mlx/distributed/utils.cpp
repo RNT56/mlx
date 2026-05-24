@@ -160,6 +160,19 @@ void TCPSocket::recv(const char* tag, void* data, size_t len) {
   }
 }
 
+address_t TCPSocket::local_address(const char* tag) const {
+  address_t result;
+  result.len = sizeof(result.addr);
+  if (getsockname(sock_, reinterpret_cast<sockaddr*>(&result.addr), &result.len) <
+      0) {
+    std::ostringstream msg;
+    msg << tag << " Couldn't get local socket address (error: " << errno
+        << ")";
+    throw std::runtime_error(msg.str());
+  }
+  return result;
+}
+
 TCPSocket TCPSocket::connect(
     const char* tag,
     const address_t& addr,

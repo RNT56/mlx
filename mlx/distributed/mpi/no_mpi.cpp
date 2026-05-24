@@ -12,7 +12,7 @@ bool is_available() {
 
 std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
   if (strict) {
-    throw std::runtime_error("Cannot initialize MPI");
+    throw UnsupportedBackendError("Cannot initialize MPI");
   }
   return nullptr;
 }

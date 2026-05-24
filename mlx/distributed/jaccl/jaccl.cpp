@@ -145,11 +145,11 @@ class JACCLGroup : public GroupImpl {
   }
 
   void sum_scatter(const array& input, array& output, Stream stream) override {
-    throw std::runtime_error("[jaccl] sum_scatter not supported.");
+    throw UnsupportedBackendError("[jaccl] sum_scatter not supported.");
   }
 
   std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("[jaccl] Group split not supported.");
+    throw UnsupportedBackendError("[jaccl] Group split not supported.");
   }
 
  private:

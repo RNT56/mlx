@@ -36,7 +36,7 @@ TEST_CASE("test einsum path") {
   path = einsum_path("ijk,jil->kl", {ones({3, 4, 5}), ones({4, 3, 2})}).first;
   CHECK_EQ(path, expected);
 
-  expected = {{0, 3}, {1, 3}, {0, 2}, {0, 1}};
+  expected = {{1, 2}, {0, 3}, {0, 2}, {0, 1}};
   path = einsum_path(
              "ijk,ilm,njm,nlk,abc->",
              {ones({2, 6, 8}),
@@ -55,6 +55,13 @@ TEST_CASE("test einsum path") {
               ones({10, 10, 10, 10}),
               ones({10, 10}),
               ones({10, 10})})
+             .first;
+  CHECK_EQ(path, expected);
+
+  expected = {{1, 2}, {0, 1}};
+  path = einsum_path(
+             "ij,jk,kl->il",
+             {ones({64, 8}), ones({8, 1024}), ones({1024, 64})})
              .first;
   CHECK_EQ(path, expected);
 }

@@ -12,7 +12,8 @@ bool is_available() {
 
 std::shared_ptr<GroupImpl> init(bool strict /* = false */) {
   if (strict) {
-    throw std::runtime_error("Cannot initialize ring distributed backend.");
+    throw UnsupportedBackendError(
+        "Cannot initialize ring distributed backend.");
   }
   return nullptr;
 }

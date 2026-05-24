@@ -21,8 +21,12 @@ class TestRingDistributed(mlx_distributed_tests.MLXDistributedCommonTestCase):
         self.assertEqual(world.size(), world2.size())
         self.assertEqual(world.rank(), world2.rank())
 
-        with self.assertRaises(RuntimeError):
-            sub = world.split(world.rank() % 2)
+        sub = world.split(world.rank() % 2)
+        self.assertEqual(sub.size(), 4)
+        self.assertEqual(sub.rank(), world.rank() // 2)
+
+        sub = world.split(world.rank() // 2)
+        self.assertEqual(sub.size(), 2)
 
     def test_all_reduce_extra(self):
         world = mx.distributed.init()
@@ -75,6 +79,13 @@ class TestRingDistributed(mlx_distributed_tests.MLXDistributedCommonTestCase):
             x = mx.ones((2, 2, 4), dtype=dt)
             y = mx.distributed.all_gather(x)
             self.assertEqual(y.shape, (world.size() * 2, 2, 4))
+            self.assertTrue(mx.all(y == 1))
+
+        sub = world.split(world.rank() % 2)
+        for dt in dtypes:
+            x = mx.ones((2, 2, 4), dtype=dt)
+            y = mx.distributed.all_gather(x, group=sub)
+            self.assertEqual(y.shape, (sub.size() * 2, 2, 4))
             self.assertTrue(mx.all(y == 1))
 
     def test_send_recv(self):

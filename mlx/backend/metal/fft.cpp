@@ -586,13 +586,21 @@ void fft_op(
     return;
   }
 
-  // TODO: allow donation here
   if (!inplace) {
-    out.set_data(
-        allocator::malloc(out.nbytes()),
-        out_data_size,
-        out_strides,
-        in_contiguous.flags());
+    bool can_donate = in_contiguous.is_donatable() &&
+        in_contiguous.dtype() == out.dtype() &&
+        in_contiguous.shape() == out.shape() &&
+        in_contiguous.data_size() == out_data_size &&
+        in_contiguous.strides() == out_strides;
+    if (can_donate) {
+      out.copy_shared_buffer(in_contiguous);
+    } else {
+      out.set_data(
+          allocator::malloc(out.nbytes()),
+          out_data_size,
+          out_strides,
+          in_contiguous.flags());
+    }
   }
 
   auto radices = supported_radices();

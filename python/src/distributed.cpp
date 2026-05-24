@@ -20,6 +20,9 @@ void init_distributed(nb::module_& parent_module) {
   auto m = parent_module.def_submodule(
       "distributed", "mlx.core.distributed: Communication operations");
 
+  nb::exception<mx::distributed::UnsupportedBackendError>(
+      m, "UnsupportedBackendError", PyExc_RuntimeError);
+
   nb::class_<mx::distributed::Group>(
       m,
       "Group",

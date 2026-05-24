@@ -92,7 +92,7 @@ void qmm_sm90(
 
   auto dA = make_stride(k, Int<1>{}, m * k);
   auto dB = make_stride(k, Int<1>{}, n * k);
-  auto dS = make_stride(Int<1>{}, n, n * k / group_size);
+  auto dS = make_stride(k / group_size, Int<1>{}, n * k / group_size);
   auto dD = make_stride(Int<1>{}, n, m * n);
   if (broadcast_b) {
     get<2>(dB) = 0;
@@ -126,16 +126,6 @@ void qmm_sm90(
 } // namespace cutlass_gemm
 
 namespace mlx::core {
-
-inline array transpose_last_2_dims(
-    const array& x,
-    cu::CommandEncoder& encoder,
-    const Stream& s) {
-  array transposed = swapaxes_in_eval(x, -1, -2);
-  array transposed_copy = contiguous_copy_gpu(transposed, s);
-  encoder.add_temporary(transposed_copy);
-  return transposed_copy;
-}
 
 template <typename F>
 inline void dispatch_element_types(Dtype dtype, const char* tag, F&& f) {
@@ -194,24 +184,21 @@ void qmm_impl_sm90(
   int k = x.shape(-1);
   int l = out.size() / (m * n);
   bool broadcast_b = (w.ndim() <= 2) || (w.size() != w.data_size());
-
-  // FIXME: Copy happens for every call.
-  array scales = transpose_last_2_dims(scales_, encoder, s);
-  array biases = transpose_last_2_dims(biases_, encoder, s);
+  (void)s;
 
   dispatch_element_types(out.dtype(), tag, [&]<typename Element>() {
     dispatch_quant_types(bits, tag, [&]<typename Quant>() {
       dispatch_groups(group_size, tag, [&](auto group_size) {
         encoder.set_input_array(x);
         encoder.set_input_array(w);
-        encoder.set_input_array(scales);
-        encoder.set_input_array(biases);
+        encoder.set_input_array(scales_);
+        encoder.set_input_array(biases_);
         encoder.set_output_array(out);
         cutlass_gemm::qmm_sm90(
             gpu_ptr<Element>(x),
             gpu_ptr<Quant>(w),
-            gpu_ptr<Element>(scales),
-            gpu_ptr<Element>(biases),
+            gpu_ptr<Element>(scales_),
+            gpu_ptr<Element>(biases_),
             gpu_ptr<Element>(out),
             m,
             n,

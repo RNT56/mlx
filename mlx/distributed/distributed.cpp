@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include <sstream>
 #include <unordered_map>
 
 #include "mlx/backend/cuda/cuda.h"
@@ -65,37 +66,38 @@ class EmptyGroup : public GroupImpl {
   }
 
   std::shared_ptr<GroupImpl> split(int color, int key = -1) override {
-    throw std::runtime_error("Cannot split the distributed group further.");
+    throw UnsupportedBackendError(
+        "[distributed] Cannot split an empty distributed group.");
   }
 
   void all_sum(const array&, array&, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
   void all_gather(const array&, array&, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
   void send(const array&, int, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
   void recv(array&, int, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
 
   void all_max(const array&, array&, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
 
   void all_min(const array&, array&, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
   void sum_scatter(const array&, array&, Stream) override {
-    throw std::runtime_error(
+    throw UnsupportedBackendError(
         "Communication not implemented in an empty distributed group.");
   }
 };
@@ -176,7 +178,8 @@ Group init(bool strict /* = false */, const std::string& bk /* = "any" */) {
       bk_ = "jaccl";
     }
     if (group == nullptr && strict) {
-      throw std::runtime_error("[distributed] Couldn't initialize any backend");
+      throw UnsupportedBackendError(
+          "[distributed] Couldn't initialize any backend");
     }
   } else {
     std::ostringstream msg;

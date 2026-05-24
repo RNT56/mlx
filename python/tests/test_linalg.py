@@ -256,6 +256,10 @@ class TestLinalg(mlx_tests.MLXTestCase):
         for M, L in zip(AB, Ls):
             self.assertTrue(mx.allclose(L @ L.T, M, rtol=1e-5, atol=1e-7))
 
+        non_psd = mx.array([[1.0, 2.0], [2.0, 1.0]], dtype=mx.float32)
+        with self.assertRaises(RuntimeError):
+            mx.eval(mx.linalg.cholesky(non_psd, stream=mx.cpu))
+
     def test_pseudo_inverse(self):
         A = mx.array([[1, 2, 3], [6, -5, 4], [-9, 8, 7]], dtype=mx.float32)
         A_plus = mx.linalg.pinv(A, stream=mx.cpu)

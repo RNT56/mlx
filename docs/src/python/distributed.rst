@@ -20,3 +20,5 @@ made available.
     send
     recv
     recv_like
+    sum_scatter
+    UnsupportedBackendError

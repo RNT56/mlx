@@ -63,7 +63,7 @@ bool supports_qmm_sm90(
   if (bits % 2 != 0) {
     return false;
   }
-  if (group_size < k) {
+  if (group_size != k) {
     return false;
   }
   if (mode != QuantizationMode::Affine) {
