@@ -2012,6 +2012,14 @@ class TestArray(mlx_tests.MLXTestCase):
         y = np.from_dlpack(x)
         self.assertTrue(mx.array_equal(y, x))
 
+    def test_array_namespace_api_version(self):
+        x = mx.array([1, 2, 3])
+        self.assertIs(x.__array_namespace__(), mx)
+        self.assertIs(x.__array_namespace__(api_version="2022.12"), mx)
+        self.assertIs(x.__array_namespace__(api_version="2023.12"), mx)
+        with self.assertRaisesRegex(ValueError, "Unsupported array API version"):
+            x.__array_namespace__(api_version="2099.12")
+
     def test_getitem_with_list(self):
         a = mx.array([1, 2, 3, 4, 5])
         idx = [0, 2, 4]
