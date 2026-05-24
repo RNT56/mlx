@@ -5,8 +5,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -491,7 +491,7 @@ class RingGroup : public GroupImpl {
       std::vector<detail::TCPSocket> listeners,
       bool verbose)
       : rank_(rank), nodes_(std::move(nodes)), verbose_(verbose), pool_(0) {
-    if (rank_ > 0 && rank_ >= nodes_.size()) {
+    if (rank_ < 0 || rank_ >= nodes_.size()) {
       throw std::runtime_error(
           "[ring] Rank cannot be larger than the size of the group");
     }
@@ -612,8 +612,11 @@ class RingGroup : public GroupImpl {
       int socket_count;
     };
 
-    SplitSpec local{color, key < 0 ? rank_ : key, rank_, static_cast<int>(
-                                                            nodes_[rank_].size())};
+    SplitSpec local{
+        color,
+        key < 0 ? rank_ : key,
+        rank_,
+        static_cast<int>(nodes_[rank_].size())};
     std::vector<SplitSpec> specs(size_);
     all_gather_impl(
         reinterpret_cast<const char*>(&local),

@@ -126,7 +126,7 @@ def reduce_case(args):
         "gpu_reduce_strided",
         "gpu",
         "float32",
-        {"x": x.shape, "axis": 0, "strides": x.strides},
+        {"x": x.shape, "axis": 0, "layout": "sliced_every_other_column"},
         lambda: mx.sum(mx.contiguous(x), axis=0),
         lambda: mx.sum(x, axis=0),
         args,
