@@ -56,6 +56,11 @@ bool fast::TurboQuantScaledDotProductAttention::use_fallback(
   return true;
 }
 
+bool fast::TurboQuantScaledDotProductAttention::native_backend_available(
+    Stream) {
+  return false;
+}
+
 void fast::TurboQuantScaledDotProductAttention::eval_gpu(
     const std::vector<array>&,
     std::vector<array>&) {

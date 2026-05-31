@@ -351,6 +351,8 @@ class TurboQuantScaledDotProductAttention : public Custom {
       Stream s,
       bool native_enabled);
 
+  static bool native_backend_available(Stream s);
+
   bool is_equivalent(const Primitive& other) const override;
 
   DEFINE_NAME(TurboQuantScaledDotProductAttention);

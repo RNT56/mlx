@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <cstdlib>
 #include <numeric>
 #include <sstream>
 #include <string_view>
@@ -1242,26 +1241,13 @@ namespace {
 
 constexpr const char* tq_sdpa_tag = "turbo_quant_segmented_attention";
 
-bool turbo_quant_native_env_enabled() {
-  const char* env = std::getenv("MLX_TURBOQUANT_NATIVE_ATTENTION");
-  return env != nullptr &&
-      (std::string_view(env) == "1" || std::string_view(env) == "true" ||
-       std::string_view(env) == "TRUE" || std::string_view(env) == "yes" ||
-       std::string_view(env) == "YES");
-}
-
 TurboQuantSegmentedAttentionBackend tq_segmented_attention_backend(
     bool allow_experimental_jit,
     Stream stream) {
-  if (stream.device == Device::cpu) {
-    return TurboQuantSegmentedAttentionBackend::Unavailable;
+  if (TurboQuantScaledDotProductAttention::native_backend_available(stream)) {
+    return TurboQuantSegmentedAttentionBackend::NativeFused;
   }
-
-  // The static/native Metal primitive path is still a linked unavailable stub.
-  // Do not report production native fused capability until eval_gpu is real.
-  if (allow_experimental_jit && turbo_quant_native_env_enabled()) {
-    return TurboQuantSegmentedAttentionBackend::ExperimentalJit;
-  }
+  (void)allow_experimental_jit;
   return TurboQuantSegmentedAttentionBackend::Unavailable;
 }
 
@@ -2051,7 +2037,8 @@ std::vector<array> turbo_quant_scaled_dot_product_attention_impl(
       options);
 
   auto stream = to_stream(s);
-  bool native_enabled = turbo_quant_native_env_enabled();
+  bool native_enabled =
+      TurboQuantScaledDotProductAttention::native_backend_available(stream);
   if (detail::in_grad_tracing()) {
     std::ostringstream msg;
     msg << "[" << tq_sdpa_tag
@@ -2066,8 +2053,6 @@ std::vector<array> turbo_quant_scaled_dot_product_attention_impl(
         << "] native MLX TurboQuant attention is unavailable";
     if (stream.device == Device::cpu) {
       msg << " on CPU streams";
-    } else if (!native_enabled) {
-      msg << " because MLX_TURBOQUANT_NATIVE_ATTENTION is not enabled";
     } else {
       msg << " for this dtype or backend";
     }

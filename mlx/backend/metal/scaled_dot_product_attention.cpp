@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/utils.h"
@@ -891,6 +892,10 @@ bool TurboQuantScaledDotProductAttention::use_fallback(
   }
   bool supported_type = q.dtype() == float32 || q.dtype() == float16;
   return !supported_type;
+}
+
+bool TurboQuantScaledDotProductAttention::native_backend_available(Stream s) {
+  return s.device == Device::gpu && metal::is_available();
 }
 
 void ScaledDotProductAttention::eval_gpu(

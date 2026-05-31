@@ -571,6 +571,25 @@ bool ScaledDotProductAttention::supports_bool_mask() {
   return false;
 }
 
+bool TurboQuantScaledDotProductAttention::use_fallback(
+    const array&,
+    bool,
+    Stream,
+    bool) {
+  return true;
+}
+
+bool TurboQuantScaledDotProductAttention::native_backend_available(Stream) {
+  return false;
+}
+
+void TurboQuantScaledDotProductAttention::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw TurboQuantNativeAttentionUnavailable(
+      "TurboQuantScaledDotProductAttention has no CUDA implementation.");
+}
+
 void ScaledDotProductAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
