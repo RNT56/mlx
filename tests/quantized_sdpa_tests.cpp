@@ -17,6 +17,17 @@ bool quantized_sdpa_uses_fallback(int qsl, int gqa, int head_dim) {
       q, k, /* is_training = */ false, Stream(0, Device::gpu));
 }
 
+bool quantized_sdpa_uses_fallback(
+    int qsl,
+    int query_heads,
+    int kv_heads,
+    int head_dim) {
+  auto q = zeros({1, query_heads, qsl, head_dim}, float16);
+  auto k = zeros({1, kv_heads, 128, head_dim / 8}, uint32);
+  return fast::QuantizedScaledDotProductAttention::use_fallback(
+      q, k, /* is_training = */ false, Stream(0, Device::gpu));
+}
+
 } // namespace
 
 TEST_CASE("quantized sdpa supports verifier batch shapes") {
@@ -25,6 +36,11 @@ TEST_CASE("quantized sdpa supports verifier batch shapes") {
       CHECK_FALSE(quantized_sdpa_uses_fallback(qsl, /* gqa = */ 8, head_dim));
     }
   }
+}
+
+TEST_CASE("quantized sdpa supports affine int4 decode gqa4 head256") {
+  CHECK_FALSE(quantized_sdpa_uses_fallback(
+      /* qsl = */ 1, /* query_heads = */ 16, /* kv_heads = */ 4, 256));
 }
 
 TEST_CASE("quantized sdpa fallback rejects unsupported gate shapes") {

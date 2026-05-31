@@ -1,9 +1,14 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <sstream>
 #include <string_view>
 
 #include "mlx/fast.h"
+#include "mlx/backend/metal/kernels/turbo_quant_attention_jit.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
@@ -1233,6 +1238,1015 @@ array quantized_scaled_dot_product_attention(
   return array(std::move(out_shape), final_type, primitive, std::move(inputs));
 }
 
+namespace {
+
+constexpr const char* tq_sdpa_tag = "turbo_quant_segmented_attention";
+
+bool turbo_quant_native_env_enabled() {
+  const char* env = std::getenv("MLX_TURBOQUANT_NATIVE_ATTENTION");
+  return env != nullptr &&
+      (std::string_view(env) == "1" || std::string_view(env) == "true" ||
+       std::string_view(env) == "TRUE" || std::string_view(env) == "yes" ||
+       std::string_view(env) == "YES");
+}
+
+TurboQuantSegmentedAttentionBackend tq_segmented_attention_backend(
+    bool allow_experimental_jit,
+    Stream stream) {
+  if (stream.device == Device::cpu) {
+    return TurboQuantSegmentedAttentionBackend::Unavailable;
+  }
+
+  // The static/native Metal primitive path is still a linked unavailable stub.
+  // Do not report production native fused capability until eval_gpu is real.
+  if (allow_experimental_jit && turbo_quant_native_env_enabled()) {
+    return TurboQuantSegmentedAttentionBackend::ExperimentalJit;
+  }
+  return TurboQuantSegmentedAttentionBackend::Unavailable;
+}
+
+void check_tq_rank(const array& x, std::string_view name, int rank) {
+  if (x.ndim() != rank) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] " << name << " with shape " << x.shape()
+        << " expected rank " << rank << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+void check_tq_dtype(
+    const array& x,
+    std::string_view name,
+    const std::vector<Dtype>& allowed) {
+  if (std::find(allowed.begin(), allowed.end(), x.dtype()) == allowed.end()) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] " << name << " has unsupported dtype "
+        << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+void check_tq_shape(
+    const array& x,
+    std::string_view name,
+    const Shape& expected) {
+  if (x.shape() != expected) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] " << name << " shape " << x.shape()
+        << " expected " << expected << ".";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+void check_tq_bitset_shape(
+    const array& x,
+    std::string_view name,
+    const Shape& expected,
+    bool compact_allowed) {
+  if (x.shape() == expected || (compact_allowed && x.shape() == Shape{1})) {
+    return;
+  }
+  std::ostringstream msg;
+  msg << "[" << tq_sdpa_tag << "] " << name << " shape " << x.shape()
+      << " expected " << expected;
+  if (compact_allowed) {
+    msg << " or compact [1]";
+  }
+  msg << ".";
+  throw std::invalid_argument(msg.str());
+}
+
+int tq_next_power_of_two_clamped(int minimum, int maximum) {
+  int target = std::max(1, std::min(maximum, minimum));
+  int width = 1;
+  while (width < target) {
+    width <<= 1;
+  }
+  return width;
+}
+
+int tq_recommended_block_width(
+    int logical_length,
+    int head_dimension,
+    int query_length,
+    int requested_split_blocks) {
+  if (query_length != 1) {
+    return 0;
+  }
+
+  int minimum = std::max(head_dimension, 512);
+  if (requested_split_blocks > 1) {
+    minimum = std::max(
+        minimum,
+        (logical_length + requested_split_blocks - 1) / requested_split_blocks);
+  } else if (logical_length < 4096) {
+    return 0;
+  } else if (logical_length > 512 * 512) {
+    minimum = std::max(
+        minimum,
+        static_cast<int>(std::ceil(std::sqrt(static_cast<double>(logical_length)))));
+  }
+
+  int block_width = tq_next_power_of_two_clamped(minimum, 512);
+  int active_blocks = (logical_length + block_width - 1) / block_width;
+  if (active_blocks <= 1 || active_blocks > block_width) {
+    return 0;
+  }
+  return block_width;
+}
+
+std::vector<std::pair<std::string, TemplateArg>> tq_seed_template(
+    std::string_view prefix,
+    uint64_t seed) {
+  std::string name(prefix);
+  return {
+      {name + "_3", static_cast<int>((seed >> 48) & 0xffff)},
+      {name + "_2", static_cast<int>((seed >> 32) & 0xffff)},
+      {name + "_1", static_cast<int>((seed >> 16) & 0xffff)},
+      {name + "_0", static_cast<int>(seed & 0xffff)}};
+}
+
+void tq_append_seed_template(
+    std::vector<std::pair<std::string, TemplateArg>>& args,
+    std::string_view prefix,
+    uint64_t seed) {
+  auto seed_args = tq_seed_template(prefix, seed);
+  args.insert(args.end(), seed_args.begin(), seed_args.end());
+}
+
+std::vector<std::pair<std::string, TemplateArg>>
+tq_runtime_layout_attention_template(
+    const array& queries,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    Dtype output_dtype) {
+  std::vector<std::pair<std::string, TemplateArg>> args = {
+      {"BATCH_SIZE", layout.batch_size},
+      {"KV_HEADS", layout.kv_head_count},
+      {"QUERY_HEADS", queries.shape(1)},
+      {"CAPACITY", layout.capacity},
+      {"QUERY_LENGTH", queries.shape(2)},
+      {"HEAD_DIM", layout.head_dimension},
+      {"GROUP_SIZE", precision.group_size},
+      {"GROUPS_PER_VECTOR", layout.groups_per_vector},
+      {"BASE_BITS", precision.key_base_bits + 1},
+      {"HIGH_BITS", precision.key_high_bits + 1},
+      {"HIGH_NUMERATOR", precision.high_precision_numerator},
+      {"HIGH_DENOMINATOR", precision.high_precision_denominator},
+      {"KEY_BASE_BITS", precision.key_base_bits},
+      {"KEY_HIGH_BITS", precision.key_high_bits},
+      {"MAG_WORDS_PER_GROUP", layout.magnitude_words_per_group},
+      {"BITSET_WORDS_PER_GROUP", layout.bitset_words_per_group},
+      {"VALUE_BITS", precision.value_bits},
+      {"SCALES_PER_GROUP", precision.key_scales_per_group},
+      {"LAYOUT_VERSION", layout.layout_version},
+      {"DETERMINISTIC_HIGH_MASK", false},
+      {"ROLE", 0},
+      {"OUTPUT_DTYPE", output_dtype},
+      {"DO_CAUSAL", options.causal}};
+  tq_append_seed_template(args, "SEED", precision.key_seed);
+  return args;
+}
+
+std::vector<std::pair<std::string, TemplateArg>> tq_attention_value_template(
+    const array& queries,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    Dtype output_dtype) {
+  auto args = tq_runtime_layout_attention_template(
+      queries, layout, precision, options, output_dtype);
+  args.push_back(
+      {"VALUE_MAG_WORDS_PER_GROUP", precision.value_magnitude_words_per_group});
+  args.push_back({"VALUE_SCALES_PER_GROUP", precision.value_scales_per_group});
+  tq_append_seed_template(args, "VALUE_SEED", precision.value_seed);
+  return args;
+}
+
+const CustomKernelFunction& tq_fused_attention_kernel() {
+  static CustomKernelFunction kernel = metal_kernel(
+      "turboquant_attention_fused_decode_runtime_layout_native",
+      {"q",
+       "k_packed",
+       "k_signs",
+       "k_high_mask",
+       "k_residual_signs",
+       "k_scales",
+       "v_packed",
+       "v_signs",
+       "v_high_mask",
+       "v_residual_signs",
+       "v_scales",
+       "runtime_logical_length",
+       "runtime_ring_offset",
+       "runtime_pinned_prefix_length",
+       "runtime_attention_scale"},
+      {"out"},
+      std::string(turbo_quant_detail::turbo_quant_fused_attention_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header),
+      false);
+  return kernel;
+}
+
+const CustomKernelFunction& tq_sparse_fused_attention_kernel() {
+  static CustomKernelFunction kernel = metal_kernel(
+      "turboquant_attention_sparse_fused_decode_runtime_layout_native",
+      {"q",
+       "k_packed",
+       "k_signs",
+       "k_high_mask",
+       "k_residual_signs",
+       "k_scales",
+       "v_packed",
+       "v_signs",
+       "v_high_mask",
+       "v_residual_signs",
+       "v_scales",
+       "runtime_logical_length",
+       "runtime_ring_offset",
+       "runtime_pinned_prefix_length",
+       "runtime_attention_scale",
+       "runtime_sparse_v_threshold"},
+      {"out", "sparse_stats"},
+      std::string(turbo_quant_detail::turbo_quant_sparse_fused_attention_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header),
+      false);
+  return kernel;
+}
+
+const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
+  static CustomKernelFunction generic_kernel = metal_kernel(
+      "turboquant_attention_fused_block_partials_runtime_layout_native",
+      {"q",
+       "k_packed",
+       "k_signs",
+       "k_high_mask",
+       "k_residual_signs",
+       "k_scales",
+       "v_packed",
+       "v_signs",
+       "v_high_mask",
+       "v_residual_signs",
+       "v_scales",
+       "runtime_logical_length",
+       "runtime_ring_offset",
+       "runtime_pinned_prefix_length",
+       "runtime_attention_scale"},
+      {"partial_stats", "partial_out"},
+      std::string(turbo_quant_detail::turbo_quant_block_partials_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header),
+      false);
+  static CustomKernelFunction gqa_kernel = metal_kernel(
+      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native",
+      {"q",
+       "k_packed",
+       "k_signs",
+       "k_high_mask",
+       "k_residual_signs",
+       "k_scales",
+       "v_packed",
+       "v_signs",
+       "v_high_mask",
+       "v_residual_signs",
+       "v_scales",
+       "runtime_logical_length",
+       "runtime_ring_offset",
+       "runtime_pinned_prefix_length",
+       "runtime_attention_scale"},
+      {"partial_stats", "partial_out"},
+      std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header),
+      false);
+  return grouped_query ? gqa_kernel : generic_kernel;
+}
+
+const CustomKernelFunction& tq_block_reduce_kernel() {
+  static CustomKernelFunction kernel = metal_kernel(
+      "turboquant_attention_fused_block_reduce_native",
+      {"partial_stats", "partial_out"},
+      {"out"},
+      std::string(turbo_quant_detail::turbo_quant_block_reduce_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header),
+      false);
+  return kernel;
+}
+
+const CustomKernelFunction& tq_sparse_diagnostics_kernel() {
+  static CustomKernelFunction kernel = metal_kernel(
+      "turboquant_attention_sparse_diagnostics_native",
+      {"sparse_stats"},
+      {"diagnostics"},
+      std::string(turbo_quant_detail::turbo_quant_sparse_diagnostics_source),
+      "",
+      false);
+  return kernel;
+}
+
+std::vector<array> tq_native_inputs(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantAttentionOptions& options) {
+  return {
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      array(layout.logical_length, int32),
+      array(layout.ring_offset, int32),
+      array(layout.pinned_prefix_length, int32),
+      array(options.scale, float32)};
+}
+
+std::vector<array> tq_native_sparse_inputs(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantAttentionOptions& options) {
+  auto inputs = tq_native_inputs(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      options);
+  inputs.push_back(array(options.sparse_v_threshold, float32));
+  return inputs;
+}
+
+array tq_diagnostics_array(
+    int backend_version,
+    int kernel_kind,
+    int active_blocks,
+    int block_tokens,
+    int sparse_skipped_tokens,
+    int sparse_total_tokens,
+    int fallback_code,
+    int flags) {
+  return array(
+      {backend_version,
+       kernel_kind,
+       active_blocks,
+       block_tokens,
+       sparse_skipped_tokens,
+       sparse_total_tokens,
+       fallback_code,
+       flags},
+      int32);
+}
+
+bool tq_cooperative_gqa_path_allowed(
+    const array& queries,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision) {
+  int repeats = queries.shape(1) / layout.kv_head_count;
+  if (repeats != 4 || layout.head_dimension != 256 || precision.group_size <= 0 ||
+      layout.logical_length < 32768 || layout.layout_version < 6) {
+    return false;
+  }
+  bool uniform = precision.key_base_bits == precision.key_high_bits;
+  bool split = precision.key_high_bits == precision.key_base_bits + 1;
+  int chunk = layout.head_dimension / 4;
+  return (uniform || split) && chunk <= precision.group_size &&
+      precision.group_size % chunk == 0;
+}
+
+std::vector<array> tq_dispatch_native_jit(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    bool output_diagnostics,
+    StreamOrDevice stream) {
+  Dtype output_dtype = queries.dtype();
+  Shape output_shape{
+      queries.shape(0), queries.shape(1), queries.shape(2), layout.head_dimension};
+  int row_count = queries.shape(0) * queries.shape(1) * queries.shape(2);
+  int repeats = queries.shape(1) / layout.kv_head_count;
+  int flags = (options.causal ? 1 : 0);
+
+  if (options.sparse_v_threshold > 0.0f) {
+    int threadgroup_width =
+        tq_next_power_of_two_clamped(std::max(layout.head_dimension, 256), 256);
+    auto sparse_template =
+        tq_attention_value_template(queries, layout, precision, options, output_dtype);
+    sparse_template.push_back({"THREADS_PER_ROW", threadgroup_width});
+    auto sparse_outputs = tq_sparse_fused_attention_kernel()(
+        tq_native_sparse_inputs(
+            queries,
+            key_packed,
+            key_signs,
+            key_high_precision_mask,
+            key_residual_signs,
+            key_scales,
+            value_packed,
+            value_signs,
+            value_high_precision_mask,
+            value_residual_signs,
+            value_scales,
+            layout,
+            options),
+        {output_shape, Shape{row_count, 2}},
+        {output_dtype, uint32},
+        {row_count * threadgroup_width, 1, 1},
+        {threadgroup_width, 1, 1},
+        std::move(sparse_template),
+        std::nullopt,
+        false,
+        stream);
+    flags |= 16;
+    if (output_diagnostics) {
+      auto diagnostics = tq_sparse_diagnostics_kernel()(
+          {sparse_outputs[1]},
+          {Shape{8}},
+          {int32},
+          {256, 1, 1},
+          {256, 1, 1},
+          {{"ROW_COUNT", row_count},
+           {"BACKEND_VERSION", options.backend_version},
+           {"KERNEL_KIND", 5},
+           {"ACTIVE_BLOCKS", 1},
+           {"BLOCK_TOKENS", threadgroup_width},
+           {"FALLBACK_CODE", 0},
+           {"FLAGS", flags}},
+          std::nullopt,
+          false,
+          stream)[0];
+      return {sparse_outputs[0], diagnostics};
+    }
+    return {sparse_outputs[0]};
+  }
+
+  auto inputs = tq_native_inputs(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      options);
+
+  int block_width = tq_recommended_block_width(
+      layout.logical_length,
+      layout.head_dimension,
+      queries.shape(2),
+      options.split_k_blocks);
+  if (block_width > 0) {
+    int active_blocks = (layout.logical_length + block_width - 1) / block_width;
+    bool grouped_query = repeats > 1 && repeats <= 4;
+    bool coop = grouped_query &&
+        tq_cooperative_gqa_path_allowed(queries, layout, precision);
+    int partial_rows = grouped_query
+        ? queries.shape(0) * layout.kv_head_count * queries.shape(2)
+        : row_count;
+    auto partial_template =
+        tq_attention_value_template(queries, layout, precision, options, output_dtype);
+    partial_template.push_back({"THREADS_PER_BLOCK", block_width});
+    partial_template.push_back({"BLOCK_TOKENS", block_width});
+    partial_template.push_back({"BLOCK_COUNT", active_blocks});
+    partial_template.push_back({"GQA_REPEATS", grouped_query ? repeats : 1});
+    partial_template.push_back({"LANES_PER_TOKEN", coop ? 4 : 1});
+
+    Dtype partial_dtype = output_dtype == float32 ? float32 : output_dtype;
+    auto partials = tq_block_partials_kernel(grouped_query)(
+        inputs,
+        {Shape{row_count, active_blocks, 2},
+         Shape{row_count, active_blocks, layout.head_dimension}},
+        {float32, partial_dtype},
+        {partial_rows * active_blocks * block_width, 1, 1},
+        {block_width, 1, 1},
+        std::move(partial_template),
+        std::nullopt,
+        false,
+        stream);
+
+    int reduce_width = tq_next_power_of_two_clamped(
+        std::max(active_blocks, layout.head_dimension), 512);
+    auto output = tq_block_reduce_kernel()(
+        partials,
+        {output_shape},
+        {output_dtype},
+        {row_count * reduce_width, 1, 1},
+        {reduce_width, 1, 1},
+        {{"ROW_COUNT", row_count},
+         {"HEAD_DIM", layout.head_dimension},
+         {"BLOCK_COUNT", active_blocks},
+         {"THREADS_PER_BLOCK", reduce_width},
+         {"OUTPUT_DTYPE", output_dtype}},
+        std::nullopt,
+        false,
+        stream)[0];
+
+    int kernel_kind = coop ? 4 : (grouped_query ? 3 : 2);
+    flags |= 2 | (grouped_query ? 4 : 0) | (coop ? 8 : 0);
+    if (output_diagnostics) {
+      return {output,
+              tq_diagnostics_array(
+                  options.backend_version,
+                  kernel_kind,
+                  active_blocks,
+                  block_width,
+                  0,
+                  0,
+                  0,
+                  flags)};
+    }
+    return {output};
+  }
+
+  int threadgroup_width =
+      tq_next_power_of_two_clamped(std::max(layout.head_dimension, 256), 256);
+  auto fused_template =
+      tq_attention_value_template(queries, layout, precision, options, output_dtype);
+  fused_template.push_back({"THREADS_PER_ROW", threadgroup_width});
+  auto output = tq_fused_attention_kernel()(
+      inputs,
+      {output_shape},
+      {output_dtype},
+      {row_count * threadgroup_width, 1, 1},
+      {threadgroup_width, 1, 1},
+      std::move(fused_template),
+      std::nullopt,
+      false,
+      stream)[0];
+
+  if (output_diagnostics) {
+    return {output,
+            tq_diagnostics_array(
+                options.backend_version,
+                1,
+                1,
+                threadgroup_width,
+                0,
+                0,
+                0,
+                flags)};
+  }
+  return {output};
+}
+
+void validate_tq_descriptors(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options) {
+  check_tq_rank(queries, "queries", 4);
+  check_tq_dtype(queries, "queries", {float16, bfloat16, float32});
+  if (queries.dtype() == bfloat16) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] bfloat16 native output is "
+        "not enabled before the rollout gate.");
+  }
+
+  if (layout.layout_version != 4 && layout.layout_version != 5 &&
+      layout.layout_version != 6) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] unsupported layout version "
+        << layout.layout_version << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (layout.batch_size <= 0 || layout.kv_head_count <= 0 ||
+      layout.capacity <= 0 || layout.logical_length < 0 ||
+      layout.logical_length > layout.capacity || layout.head_dimension <= 0 ||
+      layout.groups_per_vector <= 0 || layout.magnitude_words_per_group <= 0 ||
+      layout.bitset_words_per_group <= 0) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] invalid non-positive or "
+        "inconsistent layout descriptor.");
+  }
+  if (layout.ring_offset < 0 || layout.ring_offset >= layout.capacity) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] ring_offset must be within "
+        "compressed capacity.");
+  }
+  if (layout.pinned_prefix_length < 0 ||
+      layout.pinned_prefix_length > layout.logical_length ||
+      layout.pinned_prefix_length > layout.capacity) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] pinned_prefix_length is "
+        "outside the logical/cache range.");
+  }
+  if (!(layout.head_dimension == 64 || layout.head_dimension == 128 ||
+        layout.head_dimension == 256)) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag
+        << "] native compressed attention supports head dimension 64, 128, "
+           "or 256; received "
+        << layout.head_dimension << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(0) != layout.batch_size ||
+      queries.shape(3) != layout.head_dimension) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] query shape " << queries.shape()
+        << " is incompatible with layout batch/head dimension.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(2) <= 0 || queries.shape(2) > 8) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag
+        << "] native compressed attention supports qLen 1...8; received "
+        << queries.shape(2) << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(1) <= 0 ||
+      queries.shape(1) % layout.kv_head_count != 0) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] query heads " << queries.shape(1)
+        << " must be a positive multiple of KV heads "
+        << layout.kv_head_count << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (precision.group_size <= 0 ||
+      layout.groups_per_vector !=
+          (layout.head_dimension + precision.group_size - 1) /
+              precision.group_size) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] group_size and "
+        "groups_per_vector are inconsistent.");
+  }
+  if (precision.key_base_bits <= 0 || precision.key_high_bits <= 0 ||
+      precision.key_high_bits < precision.key_base_bits ||
+      precision.value_bits <= 0 || precision.value_bits > 8 ||
+      precision.high_precision_numerator < 0 ||
+      precision.high_precision_denominator <= 0 ||
+      precision.key_scales_per_group <= 0 ||
+      precision.value_scales_per_group <= 0 ||
+      precision.value_magnitude_words_per_group <= 0) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] invalid precision policy.");
+  }
+  if (!std::isfinite(options.scale) || options.scale <= 0) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] scale must be finite and "
+        "positive.");
+  }
+  if (options.split_k_blocks < 0) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] split_k_blocks must be "
+        "non-negative.");
+  }
+  if (!std::isfinite(options.sparse_v_threshold) ||
+      options.sparse_v_threshold < 0) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] sparse_v_threshold must be "
+        "finite and non-negative.");
+  }
+
+  Shape key_packed_shape{
+      layout.batch_size,
+      layout.kv_head_count,
+      layout.capacity,
+      layout.groups_per_vector,
+      layout.magnitude_words_per_group};
+  Shape value_packed_shape{
+      layout.batch_size,
+      layout.kv_head_count,
+      layout.capacity,
+      layout.groups_per_vector,
+      precision.value_magnitude_words_per_group};
+  Shape bitset_shape{
+      layout.batch_size,
+      layout.kv_head_count,
+      layout.capacity,
+      layout.groups_per_vector,
+      layout.bitset_words_per_group};
+  Shape key_scales_shape{
+      layout.batch_size,
+      layout.kv_head_count,
+      layout.capacity,
+      layout.groups_per_vector,
+      precision.key_scales_per_group};
+  Shape value_scales_shape{
+      layout.batch_size,
+      layout.kv_head_count,
+      layout.capacity,
+      layout.groups_per_vector,
+      precision.value_scales_per_group};
+
+  for (const auto& x : {key_packed, value_packed}) {
+    check_tq_rank(x, "packed plane", 5);
+    check_tq_dtype(x, "packed plane", {uint32});
+  }
+  check_tq_shape(key_packed, "key_packed", key_packed_shape);
+  check_tq_shape(value_packed, "value_packed", value_packed_shape);
+  for (const auto& x :
+       {key_signs,
+        key_high_precision_mask,
+        key_residual_signs,
+        value_signs,
+        value_high_precision_mask,
+        value_residual_signs}) {
+    check_tq_dtype(x, "bitset plane", {uint32});
+  }
+  check_tq_bitset_shape(key_signs, "key_signs", bitset_shape, false);
+  check_tq_bitset_shape(
+      key_high_precision_mask, "key_high_precision_mask", bitset_shape, true);
+  check_tq_bitset_shape(
+      key_residual_signs, "key_residual_signs", bitset_shape, true);
+  check_tq_bitset_shape(value_signs, "value_signs", bitset_shape, true);
+  check_tq_bitset_shape(
+      value_high_precision_mask, "value_high_precision_mask", bitset_shape, true);
+  check_tq_bitset_shape(
+      value_residual_signs, "value_residual_signs", bitset_shape, true);
+
+  check_tq_rank(key_scales, "key_scales", 5);
+  check_tq_rank(value_scales, "value_scales", 5);
+  check_tq_dtype(key_scales, "key_scales", {float16, bfloat16, float32});
+  check_tq_dtype(value_scales, "value_scales", {float16, bfloat16, float32});
+  check_tq_shape(key_scales, "key_scales", key_scales_shape);
+  check_tq_shape(value_scales, "value_scales", value_scales_shape);
+}
+
+std::vector<array> turbo_quant_scaled_dot_product_attention_impl(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    bool output_diagnostics,
+    StreamOrDevice s) {
+  validate_tq_descriptors(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      precision,
+      options);
+
+  auto stream = to_stream(s);
+  bool native_enabled = turbo_quant_native_env_enabled();
+  if (detail::in_grad_tracing()) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag
+        << "] native MLX TurboQuant attention is unavailable while tracing "
+           "gradients.";
+    throw TurboQuantNativeAttentionUnavailable(msg.str());
+  }
+  if (TurboQuantScaledDotProductAttention::use_fallback(
+          queries, detail::in_grad_tracing(), stream, native_enabled)) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag
+        << "] native MLX TurboQuant attention is unavailable";
+    if (stream.device == Device::cpu) {
+      msg << " on CPU streams";
+    } else if (!native_enabled) {
+      msg << " because MLX_TURBOQUANT_NATIVE_ATTENTION is not enabled";
+    } else {
+      msg << " for this dtype or backend";
+    }
+    msg << ".";
+    throw TurboQuantNativeAttentionUnavailable(msg.str());
+  }
+
+  return tq_dispatch_native_jit(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      precision,
+      options,
+      output_diagnostics,
+      stream);
+}
+
+} // namespace
+
+TurboQuantSegmentedAttentionBackend turbo_quant_segmented_attention_backend(
+    bool allow_experimental_jit,
+    StreamOrDevice s) {
+  return tq_segmented_attention_backend(allow_experimental_jit, to_stream(s));
+}
+
+bool turbo_quant_segmented_attention_is_available(
+    bool allow_experimental_jit,
+    StreamOrDevice s) {
+  return turbo_quant_segmented_attention_backend(allow_experimental_jit, s) !=
+      TurboQuantSegmentedAttentionBackend::Unavailable;
+}
+
+array turbo_quant_segmented_attention(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s) {
+  return turbo_quant_scaled_dot_product_attention_impl(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      precision,
+      options,
+      false,
+      s)[0];
+}
+
+std::vector<array> turbo_quant_segmented_attention_with_diagnostics(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s) {
+  return turbo_quant_scaled_dot_product_attention_impl(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      precision,
+      options,
+      true,
+      s);
+}
+
+array turbo_quant_scaled_dot_product_attention(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s) {
+  return turbo_quant_segmented_attention(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      precision,
+      options,
+      s);
+}
+
+std::vector<array> turbo_quant_scaled_dot_product_attention_with_diagnostics(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s) {
+  return turbo_quant_segmented_attention_with_diagnostics(
+      queries,
+      key_packed,
+      key_signs,
+      key_high_precision_mask,
+      key_residual_signs,
+      key_scales,
+      value_packed,
+      value_signs,
+      value_high_precision_mask,
+      value_residual_signs,
+      value_scales,
+      layout,
+      precision,
+      options,
+      s);
+}
+
 std::vector<array> ScaledDotProductAttention::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -1295,6 +2309,17 @@ bool QuantizedScaledDotProductAttention::is_equivalent(
       has_sinks_ == a_other.has_sinks_ && do_causal_ == a_other.do_causal_ &&
       group_size_ == a_other.group_size_ && bits_ == a_other.bits_ &&
       mode_ == a_other.mode_;
+}
+
+bool TurboQuantScaledDotProductAttention::is_equivalent(
+    const Primitive& other) const {
+  const TurboQuantScaledDotProductAttention& a_other =
+      static_cast<const TurboQuantScaledDotProductAttention&>(other);
+  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
+      split_k_blocks_ == a_other.split_k_blocks_ &&
+      sparse_v_threshold_ == a_other.sparse_v_threshold_ &&
+      output_diagnostics_ == a_other.output_diagnostics_ &&
+      backend_version_ == a_other.backend_version_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {

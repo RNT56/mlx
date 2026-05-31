@@ -881,6 +881,18 @@ bool QuantizedScaledDotProductAttention::use_fallback(
       (gqa_factor > 32);
 }
 
+bool TurboQuantScaledDotProductAttention::use_fallback(
+    const array& q,
+    bool is_training,
+    Stream s,
+    bool native_enabled) {
+  if (!native_enabled || is_training || s.device == Device::cpu) {
+    return true;
+  }
+  bool supported_type = q.dtype() == float32 || q.dtype() == float16;
+  return !supported_type;
+}
+
 void ScaledDotProductAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
@@ -1154,6 +1166,14 @@ void QuantizedScaledDotProductAttention::eval_gpu(
       mode_);
 
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
+}
+
+void TurboQuantScaledDotProductAttention::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw TurboQuantNativeAttentionUnavailable(
+      "TurboQuantScaledDotProductAttention Metal kernels are not linked in "
+      "this build.");
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {

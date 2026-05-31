@@ -48,6 +48,21 @@ bool fast::QuantizedScaledDotProductAttention::use_fallback(
   return true;
 }
 
+bool fast::TurboQuantScaledDotProductAttention::use_fallback(
+    const array&,
+    bool,
+    Stream,
+    bool) {
+  return true;
+}
+
+void fast::TurboQuantScaledDotProductAttention::eval_gpu(
+    const std::vector<array>&,
+    std::vector<array>&) {
+  throw fast::TurboQuantNativeAttentionUnavailable(
+      "TurboQuantScaledDotProductAttention has no GPU implementation.");
+}
+
 bool fast::ScaledDotProductAttentionVJP::use_fallback(
     const array& q,
     Stream s) {
