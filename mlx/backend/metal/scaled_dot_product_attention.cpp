@@ -25,7 +25,13 @@ int select_sdpa_blocks(
     [[maybe_unused]] bool quantized) {
   if (devc == 's') {
     int blocks = 64;
-    if (N > 1024 && n_simds > 4) {
+    if (quantized && N >= 16384 && n_simds >= 4) {
+      if (N <= 65536) {
+        blocks = 256;
+      } else {
+        blocks = 1024;
+      }
+    } else if (N > 1024 && n_simds > 4) {
       if (N <= 8192) {
         blocks = 128;
       } else if (N <= 32768) {
@@ -645,15 +651,20 @@ void quant_sdpa_vector_2pass(
     const std::optional<array>& v_biases,
     array& out,
     float scale,
-    int group_size,
-    int bits,
+    int key_group_size,
+    int key_bits,
+    int value_group_size,
+    int value_bits,
     bool do_causal,
     const std::optional<array>& mask,
     const std::optional<array>& sinks,
     QuantizationMode mode) {
   std::string kname;
   kname.reserve(64);
-  kname += "quant_sdpa_vector_2pass_1_";
+  bool mixed_quantization =
+      key_group_size != value_group_size || key_bits != value_bits;
+  kname += mixed_quantization ? "mixed_quant_sdpa_vector_2pass_1_"
+                              : "quant_sdpa_vector_2pass_1_";
   kname += get_type_string(q.dtype());
   kname += "_";
   kname += std::to_string(q.shape(-1));
@@ -711,10 +722,15 @@ void quant_sdpa_vector_2pass(
       {&blocks, MTL::DataType::DataTypeInt, 26},
       {&has_affine_bias, MTL::DataType::DataTypeBool, 27},
       {&quant_mode_int, MTL::DataType::DataTypeInt, 28},
-      {&bits, MTL::DataType::DataTypeInt, 29},
-      {&group_size, MTL::DataType::DataTypeInt, 30},
+      {&key_bits, MTL::DataType::DataTypeInt, 29},
+      {&key_group_size, MTL::DataType::DataTypeInt, 30},
       {&q_seq_len, MTL::DataType::DataTypeInt, 31},
   };
+  if (mixed_quantization) {
+    func_consts.push_back({&value_bits, MTL::DataType::DataTypeInt, 32});
+    func_consts.push_back(
+        {&value_group_size, MTL::DataType::DataTypeInt, 33});
+  }
   std::string hash_name = kname;
   hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
   hash_name += query_transposed ? "_qt" : "_qnt";
@@ -722,8 +738,10 @@ void quant_sdpa_vector_2pass(
   hash_name += has_sinks ? "_s" : "_ns";
   hash_name += has_affine_bias ? "_affine_" : "_noaffine_";
   hash_name += std::to_string(quant_mode_int) + "_";
-  hash_name += std::to_string(bits) + "_";
-  hash_name += std::to_string(group_size) + "_";
+  hash_name += std::to_string(key_bits) + "_";
+  hash_name += std::to_string(key_group_size) + "_";
+  hash_name += std::to_string(value_bits) + "_";
+  hash_name += std::to_string(value_group_size) + "_";
   hash_name += std::to_string(q_seq_len) + "_";
   hash_name += std::to_string(blocks);
 
@@ -1163,8 +1181,10 @@ void QuantizedScaledDotProductAttention::eval_gpu(
       v_biases,
       o,
       scale_,
-      group_size_,
-      bits_,
+      key_group_size_,
+      key_bits_,
+      value_group_size_,
+      value_bits_,
       do_causal,
       mask,
       sinks,
@@ -1177,8 +1197,9 @@ void TurboQuantScaledDotProductAttention::eval_gpu(
     const std::vector<array>&,
     std::vector<array>&) {
   throw TurboQuantNativeAttentionUnavailable(
-      "TurboQuantScaledDotProductAttention Metal kernels are not linked in "
-      "this build.");
+      "TurboQuantScaledDotProductAttention direct primitive eval is not "
+      "wired; use fast::turbo_quant_segmented_attention for the fused Metal "
+      "backend.");
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {

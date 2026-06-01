@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "mlx/fast.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/kernels/turbo_quant_attention_jit.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
@@ -1233,6 +1234,404 @@ array quantized_scaled_dot_product_attention(
       do_causal,
       group_size,
       bits,
+      group_size,
+      bits,
+      qmode);
+  return array(std::move(out_shape), final_type, primitive, std::move(inputs));
+}
+
+array mixed_quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const std::optional<array>& key_biases,
+    const array& values,
+    const array& value_scales,
+    const std::optional<array>& value_biases,
+    const float scale,
+    const std::optional<array>& mask /* = std::nullopt */,
+    const std::optional<array>& sinks /* = std::nullopt */,
+    int key_group_size /* = 64 */,
+    int key_bits /* = 8 */,
+    int value_group_size /* = 32 */,
+    int value_bits /* = 4 */,
+    bool causal /* = false */,
+    StreamOrDevice s /* = {} */) {
+  constexpr const char* tag = "mixed_quantized_scaled_dot_product_attention";
+  auto qmode = QuantizationMode::Affine;
+
+  auto validate_affine_params = [&](std::string_view name,
+                                    int group_size,
+                                    int bits) {
+    if (group_size != 32 && group_size != 64) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << name
+          << " affine group_size must be 32 or 64 but received "
+          << group_size << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (bits != 4 && bits != 6 && bits != 8) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << name
+          << " affine bits must be 4, 6, or 8 but received " << bits << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  };
+  validate_affine_params("key", key_group_size, key_bits);
+  validate_affine_params("value", value_group_size, value_bits);
+  if (key_bits != 8 || value_bits != 4) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] native mixed affine SDPA supports only K8/V4 quantization; "
+        << "received key_bits=" << key_bits
+        << " and value_bits=" << value_bits << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!key_biases.has_value() || !value_biases.has_value()) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] Affine mode requires "
+        "key_biases and value_biases.");
+  }
+
+  for (const auto& t : {queries, keys, key_scales, values, value_scales}) {
+    if (t.ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] input with shape " << t.shape()
+          << " expected to be rank 4.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  if (key_biases->ndim() != 4 || value_biases->ndim() != 4) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] Biases must be rank 4.");
+  }
+
+  auto final_type = queries.dtype();
+  if (!issubdtype(final_type, floating)) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] queries must be floating type but got "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!(final_type == float16 || final_type == bfloat16 ||
+        final_type == float32)) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] queries must be float16, bfloat16, or float32; received "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.dtype() != uint32 || values.dtype() != uint32) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] Keys and values must "
+        "be uint32.");
+  }
+
+  auto key_head_dim = (keys.shape(-1) * 32) / key_bits;
+  auto value_head_dim = (values.shape(-1) * 32) / value_bits;
+  auto n_q_heads = queries.shape(-3);
+  auto n_kv_heads = keys.shape(-3);
+  auto query_sequence_length = queries.shape(-2);
+  auto key_sequence_length = keys.shape(-2);
+  auto head_dim = queries.shape(-1);
+
+  if (queries.shape(0) <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 ||
+      query_sequence_length <= 0 || key_sequence_length <= 0 ||
+      head_dim <= 0) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] inputs must have "
+        "positive batch, head, sequence, and head dimensions.");
+  }
+
+  if (queries.shape(0) != keys.shape(0) ||
+      queries.shape(0) != values.shape(0)) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] Batch dimensions must match.");
+  }
+  if (n_q_heads % n_kv_heads != 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] n_heads must be a multiple of n_kv_heads, found "
+        << n_q_heads << " vs " << n_kv_heads << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (keys.shape(-3) != values.shape(-3) ||
+      keys.shape(-2) != values.shape(-2)) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] Keys and values must "
+        "have matching n_kv_heads and sequence length.");
+  }
+  if (queries.shape(-1) != key_head_dim ||
+      queries.shape(-1) != value_head_dim) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Query head dim " << queries.shape(-1)
+        << " must match key (" << key_head_dim << ") and value ("
+        << value_head_dim << ").";
+    throw std::invalid_argument(msg.str());
+  }
+  if (queries.shape(-1) % key_group_size != 0 ||
+      queries.shape(-1) % value_group_size != 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Head dim " << queries.shape(-1)
+        << " must be divisible by key_group_size " << key_group_size
+        << " and value_group_size " << value_group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto validate_scale = [&](const array& qdata,
+                            const array& scales,
+                            const std::optional<array>& biases,
+                            int group_size,
+                            std::string_view name) {
+    auto expected_scale_dim = queries.shape(-1) / group_size;
+    if (scales.shape(-1) != expected_scale_dim ||
+        scales.shape(0) != qdata.shape(0) ||
+        scales.shape(-3) != qdata.shape(-3) ||
+        scales.shape(-2) != qdata.shape(-2)) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << name << " scale shape mismatch.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (biases.has_value() && biases->shape() != scales.shape()) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << name
+          << " bias shape must match scale shape.";
+      throw std::invalid_argument(msg.str());
+    }
+  };
+  validate_scale(keys, key_scales, key_biases, key_group_size, "key");
+  validate_scale(values, value_scales, value_biases, value_group_size, "value");
+  auto validate_affine_dtype = [&](const array& param, std::string_view name) {
+    if (!issubdtype(param.dtype(), floating)) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << name
+          << " must be floating type but got " << param.dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  };
+  validate_affine_dtype(key_scales, "key scales");
+  validate_affine_dtype(*key_biases, "key biases");
+  validate_affine_dtype(value_scales, "value scales");
+  validate_affine_dtype(*value_biases, "value biases");
+
+  bool do_causal = causal;
+  bool has_arr_mask = mask.has_value();
+  bool has_sinks = sinks.has_value();
+  if (do_causal && has_arr_mask) {
+    throw std::invalid_argument(
+        "[mixed_quantized_scaled_dot_product_attention] Received both "
+        "causal=true and an array mask.");
+  }
+  if (has_arr_mask && mask->ndim() > 4) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] Mask with shape " << mask->shape()
+        << " expected to have at most rank 4.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto stream = to_stream(s);
+  auto gqa_factor = n_q_heads / n_kv_heads;
+  auto validate_native_support = [&]() {
+    if (query_sequence_length > 32) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] query sequence length "
+          << query_sequence_length << " exceeds native K8/V4 limit 32.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (query_sequence_length > key_sequence_length) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] query sequence length "
+          << query_sequence_length
+          << " must not exceed key sequence length " << key_sequence_length
+          << " for native K8/V4 SDPA.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (!(head_dim == 64 || head_dim == 128 || head_dim == 256 ||
+          head_dim == 512)) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] head dimension " << head_dim
+          << " is not native K8/V4 certified; expected one of "
+             "{64, 128, 256, 512}.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (gqa_factor > 32) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] GQA factor " << gqa_factor
+          << " exceeds native K8/V4 limit 32.";
+      throw std::invalid_argument(msg.str());
+    }
+    if (stream.device != Device::gpu || !metal::is_available()) {
+      throw std::invalid_argument(
+          "[mixed_quantized_scaled_dot_product_attention] native K8/V4 SDPA "
+          "requires an available Metal GPU stream.");
+    }
+    if (detail::in_grad_tracing()) {
+      throw std::invalid_argument(
+          "[mixed_quantized_scaled_dot_product_attention] native K8/V4 SDPA "
+          "does not support gradient tracing.");
+    }
+  };
+  validate_native_support();
+
+  auto q = astype(queries, final_type, stream);
+  auto key_scales_cast = astype(key_scales, final_type, stream);
+  auto key_biases_cast = astype(*key_biases, final_type, stream);
+  auto value_scales_cast = astype(value_scales, final_type, stream);
+  auto value_biases_cast = astype(*value_biases, final_type, stream);
+  auto fallback = [scale,
+                   n_q_heads,
+                   n_kv_heads,
+                   do_causal,
+                   has_arr_mask,
+                   has_sinks,
+                   key_group_size,
+                   key_bits,
+                   value_group_size,
+                   value_bits,
+                   s](const std::vector<array>& inputs) {
+    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    int n_repeats = n_q_heads / n_kv_heads;
+
+    auto k = inputs[1];
+    auto k_scales = inputs[2];
+    std::optional<array> k_biases = inputs[3];
+    auto v = inputs[4];
+    auto v_scales = inputs[5];
+    std::optional<array> v_biases = inputs[6];
+    int idx = 7;
+
+    std::optional<array> arr_mask =
+        has_arr_mask ? std::optional<array>{inputs[idx++]} : std::nullopt;
+    std::optional<array> sinks_opt =
+        has_sinks ? std::optional<array>{inputs[idx++]} : std::nullopt;
+
+    if (n_repeats > 1) {
+      q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
+      k = expand_dims(k, 2, s);
+      k_scales = expand_dims(k_scales, 2, s);
+      k_biases = expand_dims(*k_biases, 2, s);
+      v = expand_dims(v, 2, s);
+      v_scales = expand_dims(v_scales, 2, s);
+      v_biases = expand_dims(*v_biases, 2, s);
+    }
+
+    auto scores = quantized_matmul(
+        q,
+        k,
+        k_scales,
+        k_biases,
+        /*transpose=*/true,
+        key_group_size,
+        key_bits,
+        "affine",
+        s);
+    if (has_arr_mask || do_causal) {
+      auto make_or_fetch_mask = [&]() {
+        if (do_causal) {
+          int kL = k.shape(-2);
+          int qL = q.shape(-2);
+          int offset = kL - qL;
+          auto q_idx = arange(offset, qL + offset, s);
+          auto k_idx = arange(0, kL, s);
+          q_idx = expand_dims(q_idx, 1, s);
+          k_idx = expand_dims(k_idx, 0, s);
+          return greater_equal(q_idx, k_idx, s);
+        }
+        return *arr_mask;
+      };
+      auto m = make_or_fetch_mask();
+      if (n_repeats > 1 && m.ndim() >= 3) {
+        if (m.shape(-3) == 1) {
+          m = expand_dims(m, -3, s);
+        } else {
+          m = unflatten(m, -3, {n_kv_heads, n_repeats}, s);
+        }
+      }
+      if (m.dtype() == bool_) {
+        scores = where(
+            m, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
+      } else {
+        scores = add(scores, m, s);
+      }
+    }
+
+    if (has_sinks) {
+      auto sinks = *sinks_opt;
+      sinks = expand_dims(sinks, {0, 2, 3}, s);
+      if (scores.ndim() == 5) {
+        sinks = unflatten(sinks, 1, {n_kv_heads, n_repeats}, s);
+      }
+      auto bsx_shape = scores.shape();
+      bsx_shape.back() = 1;
+      scores = concatenate({broadcast_to(sinks, bsx_shape, s), scores}, -1, s);
+    }
+    scores = softmax(scores, std::vector<int>{-1}, true, s);
+    if (has_sinks) {
+      auto start = Shape(scores.ndim(), 0);
+      start.back() = 1;
+      auto stop = scores.shape();
+      scores = slice(scores, std::move(start), std::move(stop), s);
+    }
+    auto out = quantized_matmul(
+        scores,
+        v,
+        v_scales,
+        v_biases,
+        /*transpose=*/false,
+        value_group_size,
+        value_bits,
+        "affine",
+        s);
+    if (n_repeats > 1) {
+      out = flatten(out, 1, 2, s);
+    }
+    return std::vector<array>{out};
+  };
+
+  Shape full_mask_shape{
+      queries.shape(0), queries.shape(1), queries.shape(2), keys.shape(-2)};
+
+  std::vector<array> inputs = {q,
+                               keys,
+                               key_scales_cast,
+                               key_biases_cast,
+                               values,
+                               value_scales_cast,
+                               value_biases_cast};
+  if (has_arr_mask) {
+    auto prepared_mask = prepare_sdpa_array_mask(
+        *mask, final_type, full_mask_shape, tag, stream);
+    inputs.push_back(std::move(prepared_mask.first));
+  }
+  if (has_sinks) {
+    if (promote_types(sinks->dtype(), final_type) != final_type) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Type of sinks must promote to output type "
+          << final_type << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (sinks->ndim() != 1 || sinks->shape(0) != n_q_heads) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] Received invalid shape for sinks "
+          << sinks->shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    inputs.push_back(astype(*sinks, final_type, stream));
+  }
+
+  Shape out_shape{
+      queries.shape(0), queries.shape(1), queries.shape(2), value_head_dim};
+
+  auto primitive = std::make_shared<QuantizedScaledDotProductAttention>(
+      stream,
+      fallback,
+      scale,
+      has_arr_mask,
+      has_sinks,
+      do_causal,
+      key_group_size,
+      key_bits,
+      value_group_size,
+      value_bits,
       qmode);
   return array(std::move(out_shape), final_type, primitive, std::move(inputs));
 }
@@ -1241,13 +1640,19 @@ namespace {
 
 constexpr const char* tq_sdpa_tag = "turbo_quant_segmented_attention";
 
+bool tq_experimental_jit_available(Stream stream) {
+  return stream.device == Device::gpu && metal::is_available();
+}
+
 TurboQuantSegmentedAttentionBackend tq_segmented_attention_backend(
     bool allow_experimental_jit,
     Stream stream) {
   if (TurboQuantScaledDotProductAttention::native_backend_available(stream)) {
     return TurboQuantSegmentedAttentionBackend::NativeFused;
   }
-  (void)allow_experimental_jit;
+  if (allow_experimental_jit && tq_experimental_jit_available(stream)) {
+    return TurboQuantSegmentedAttentionBackend::ExperimentalJit;
+  }
   return TurboQuantSegmentedAttentionBackend::Unavailable;
 }
 
@@ -2038,7 +2443,8 @@ std::vector<array> turbo_quant_scaled_dot_product_attention_impl(
 
   auto stream = to_stream(s);
   bool native_enabled =
-      TurboQuantScaledDotProductAttention::native_backend_available(stream);
+      TurboQuantScaledDotProductAttention::native_backend_available(stream) ||
+      tq_experimental_jit_available(stream);
   if (detail::in_grad_tracing()) {
     std::ostringstream msg;
     msg << "[" << tq_sdpa_tag
@@ -2292,7 +2698,10 @@ bool QuantizedScaledDotProductAttention::is_equivalent(
       static_cast<const QuantizedScaledDotProductAttention&>(other);
   return scale_ == a_other.scale_ && has_arr_mask_ == a_other.has_arr_mask_ &&
       has_sinks_ == a_other.has_sinks_ && do_causal_ == a_other.do_causal_ &&
-      group_size_ == a_other.group_size_ && bits_ == a_other.bits_ &&
+      key_group_size_ == a_other.key_group_size_ &&
+      key_bits_ == a_other.key_bits_ &&
+      value_group_size_ == a_other.value_group_size_ &&
+      value_bits_ == a_other.value_bits_ &&
       mode_ == a_other.mode_;
 }
 
