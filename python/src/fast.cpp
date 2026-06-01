@@ -396,6 +396,100 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "mixed_quantized_scaled_dot_product_attention",
+      [](const mx::array& q,
+         const mx::array& k,
+         const mx::array& k_scales,
+         const std::optional<mx::array>& k_biases,
+         const mx::array& v,
+         const mx::array& v_scales,
+         const std::optional<mx::array>& v_biases,
+         float scale,
+         const std::optional<mx::array>& mask,
+         const std::optional<mx::array>& sinks,
+         int key_group_size,
+         int key_bits,
+         int value_group_size,
+         int value_bits,
+         const std::string& mode,
+         bool causal,
+         mx::StreamOrDevice s) {
+        if (mode != "affine") {
+          std::ostringstream msg;
+          msg << "[mixed_quantized_scaled_dot_product_attention] mode must be "
+                 "\"affine\" for the production K8/V4 native path but got \""
+              << mode << "\".";
+          throw std::invalid_argument(msg.str());
+        }
+        return mx::fast::mixed_quantized_scaled_dot_product_attention(
+            q,
+            k,
+            k_scales,
+            k_biases,
+            v,
+            v_scales,
+            v_biases,
+            scale,
+            mask,
+            sinks,
+            key_group_size,
+            key_bits,
+            value_group_size,
+            value_bits,
+            causal,
+            s);
+      },
+      "q"_a,
+      "k"_a,
+      "k_scales"_a,
+      "k_biases"_a,
+      "v"_a,
+      "v_scales"_a,
+      "v_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
+      "key_group_size"_a = 64,
+      "key_bits"_a = 8,
+      "value_group_size"_a = 32,
+      "value_bits"_a = 4,
+      "mode"_a = "affine",
+      "causal"_a = false,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def mixed_quantized_scaled_dot_product_attention(q: array, k: array, k_scales: array, k_biases: array, v: array, v_scales: array, v_biases: array, *, scale: float, mask: Optional[array] = None, sinks: Optional[array] = None, key_group_size: int = 64, key_bits: int = 8, value_group_size: int = 32, value_bits: int = 4, mode: str = \"affine\", causal: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        A fast implementation of multi-head attention where keys and values are
+        quantized with different bit widths and group sizes.
+
+        This is the native packed K/V path used for affine K8/V4 speed routes:
+        keys can remain at 8-bit while values use 4-bit storage, with QK,
+        softmax, and AV fused without materializing full precision K/V.
+
+        Args:
+            q (array): Input query array.
+            k (array): Packed quantized keys.
+            k_scales (array): Key scales.
+            k_biases (array): Key affine biases.
+            v (array): Packed quantized values.
+            v_scales (array): Value scales.
+            v_biases (array): Value affine biases.
+            scale (float): Scale for queries.
+            mask (array, optional): An additive or boolean mask.
+            sinks (array, optional): Optional attention sinks with shape ``[N_q]``.
+            key_group_size (int): Key quantization group size.
+            key_bits (int): Key bit width.
+            value_group_size (int): Value quantization group size.
+            value_bits (int): Value bit width.
+            mode (str): Quantization mode. Currently production K8/V4 uses ``"affine"``.
+            causal (bool): Whether to apply lower-right aligned causal masking.
+              Cannot be used together with ``mask``.
+        Returns:
+            array: The output array.
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

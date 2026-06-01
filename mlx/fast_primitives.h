@@ -270,16 +270,20 @@ class QuantizedScaledDotProductAttention : public Custom {
       bool has_arr_mask,
       bool has_sinks,
       bool do_causal,
-      int group_size,
-      int bits,
+      int key_group_size,
+      int key_bits,
+      int value_group_size,
+      int value_bits,
       QuantizationMode mode)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         has_arr_mask_(has_arr_mask),
         has_sinks_(has_sinks),
         do_causal_(do_causal),
-        group_size_(group_size),
-        bits_(bits),
+        key_group_size_(key_group_size),
+        key_bits_(key_bits),
+        value_group_size_(value_group_size),
+        value_bits_(value_bits),
         mode_(mode) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
@@ -303,8 +307,10 @@ class QuantizedScaledDotProductAttention : public Custom {
         has_arr_mask_,
         has_sinks_,
         do_causal_,
-        group_size_,
-        bits_,
+        key_group_size_,
+        key_bits_,
+        value_group_size_,
+        value_bits_,
         mode_);
   }
 
@@ -313,8 +319,10 @@ class QuantizedScaledDotProductAttention : public Custom {
   bool has_arr_mask_;
   bool has_sinks_;
   bool do_causal_;
-  int group_size_;
-  int bits_;
+  int key_group_size_;
+  int key_bits_;
+  int value_group_size_;
+  int value_bits_;
   QuantizationMode mode_;
 };
 

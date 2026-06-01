@@ -60,7 +60,7 @@ array call_turbo_quant_attention(
 
 } // namespace
 
-TEST_CASE("turbo quant segmented attention reports no production native backend") {
+TEST_CASE("turbo quant segmented attention reports no native backend on CPU") {
   CHECK_EQ(
       fast::turbo_quant_segmented_attention_backend(false, Device::cpu),
       fast::TurboQuantSegmentedAttentionBackend::Unavailable);
@@ -73,7 +73,7 @@ TEST_CASE("turbo quant segmented attention reports no production native backend"
       fast::turbo_quant_segmented_attention_is_available(true, Device::cpu));
 }
 
-TEST_CASE("turbo quant segmented attention reports fused native Metal backend") {
+TEST_CASE("turbo quant segmented attention reports production Metal backend") {
   if (!metal::is_available()) {
     return;
   }
@@ -82,6 +82,11 @@ TEST_CASE("turbo quant segmented attention reports fused native Metal backend") 
       fast::TurboQuantSegmentedAttentionBackend::NativeFused);
   CHECK(
       fast::turbo_quant_segmented_attention_is_available(false, Device::gpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend(true, Device::gpu),
+      fast::TurboQuantSegmentedAttentionBackend::NativeFused);
+  CHECK(
+      fast::turbo_quant_segmented_attention_is_available(true, Device::gpu));
 }
 
 TEST_CASE("turbo quant native attention validates query rank and q length") {

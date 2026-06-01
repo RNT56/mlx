@@ -872,6 +872,44 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     tol = 2e-2
                 self.assertLess((out - ref).abs().max(), tol)
 
+    def test_mixed_quantized_sdpa_affine_k8_v4(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Quantized fast attention is only available on GPU.")
+
+        mx.random.seed(0)
+        B, Hq, Hkv = 1, 4, 1
+        Lq, Lk, D = 1, 1024, 256
+        q = 0.1 * mx.random.normal(shape=(B, Hq, Lq, D))
+        k = 0.1 * mx.random.normal(shape=(B, Hkv, Lk, D))
+        v = 0.1 * mx.random.normal(shape=(B, Hkv, Lk, D))
+
+        k_q, k_scales, k_biases = mx.quantize(
+            k, group_size=64, bits=8, mode="affine"
+        )
+        v_q, v_scales, v_biases = mx.quantize(
+            v, group_size=32, bits=4, mode="affine"
+        )
+
+        ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0)
+        out = mx.fast.mixed_quantized_scaled_dot_product_attention(
+            q,
+            k_q,
+            k_scales,
+            k_biases,
+            v_q,
+            v_scales,
+            v_biases,
+            scale=1.0,
+            mode="affine",
+            key_group_size=64,
+            key_bits=8,
+            value_group_size=32,
+            value_bits=4,
+        )
+
+        self.assertEqual(out.shape, ref.shape)
+        self.assertLess((out - ref).abs().max(), 5e-2)
+
     def test_quantized_sdpa_masked(self):
         if mx.default_device() == mx.cpu:
             self.skipTest("Quantized fast attention is only available on GPU.")

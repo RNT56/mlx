@@ -59,4 +59,21 @@ instantiate_sdpa_vector_heads(float16_t)
 instantiate_quant_sdpa_vector_heads(float)
 instantiate_quant_sdpa_vector_heads(bfloat16_t)
 instantiate_quant_sdpa_vector_heads(float16_t)
+
+#define instantiate_mixed_quant_sdpa_vector(type, qk_dim, value_dim)         \
+  instantiate_kernel(                                                        \
+      "mixed_quant_sdpa_vector_2pass_1_" #type "_" #qk_dim "_" #value_dim,   \
+      mixed_quant_sdpa_vector_2pass_1,                                       \
+      type,                                                                  \
+      qk_dim)
+
+#define instantiate_mixed_quant_sdpa_vector_heads(type) \
+  instantiate_mixed_quant_sdpa_vector(type, 64, 64)     \
+  instantiate_mixed_quant_sdpa_vector(type, 128, 128)   \
+  instantiate_mixed_quant_sdpa_vector(type, 256, 256)   \
+  instantiate_mixed_quant_sdpa_vector(type, 512, 512)
+
+instantiate_mixed_quant_sdpa_vector_heads(float)
+instantiate_mixed_quant_sdpa_vector_heads(bfloat16_t)
+instantiate_mixed_quant_sdpa_vector_heads(float16_t)
     // clang-format on
