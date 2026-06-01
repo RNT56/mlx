@@ -1193,15 +1193,6 @@ void QuantizedScaledDotProductAttention::eval_gpu(
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
 }
 
-void TurboQuantScaledDotProductAttention::eval_gpu(
-    const std::vector<array>&,
-    std::vector<array>&) {
-  throw TurboQuantNativeAttentionUnavailable(
-      "TurboQuantScaledDotProductAttention direct primitive eval is not "
-      "wired; use fast::turbo_quant_segmented_attention for the fused Metal "
-      "backend.");
-}
-
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
   return true;
 }
