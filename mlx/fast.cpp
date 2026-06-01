@@ -2705,17 +2705,6 @@ bool QuantizedScaledDotProductAttention::is_equivalent(
       mode_ == a_other.mode_;
 }
 
-bool TurboQuantScaledDotProductAttention::is_equivalent(
-    const Primitive& other) const {
-  const TurboQuantScaledDotProductAttention& a_other =
-      static_cast<const TurboQuantScaledDotProductAttention&>(other);
-  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
-      split_k_blocks_ == a_other.split_k_blocks_ &&
-      sparse_v_threshold_ == a_other.sparse_v_threshold_ &&
-      output_diagnostics_ == a_other.output_diagnostics_ &&
-      backend_version_ == a_other.backend_version_;
-}
-
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
   const ScaledDotProductAttentionVJP& a_other =
       static_cast<const ScaledDotProductAttentionVJP&>(other);

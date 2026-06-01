@@ -61,13 +61,6 @@ bool fast::TurboQuantScaledDotProductAttention::native_backend_available(
   return false;
 }
 
-void fast::TurboQuantScaledDotProductAttention::eval_gpu(
-    const std::vector<array>&,
-    std::vector<array>&) {
-  throw fast::TurboQuantNativeAttentionUnavailable(
-      "TurboQuantScaledDotProductAttention has no GPU implementation.");
-}
-
 bool fast::ScaledDotProductAttentionVJP::use_fallback(
     const array& q,
     Stream s) {

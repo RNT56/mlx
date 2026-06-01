@@ -326,33 +326,8 @@ class QuantizedScaledDotProductAttention : public Custom {
   QuantizationMode mode_;
 };
 
-class TurboQuantScaledDotProductAttention : public Custom {
+class TurboQuantScaledDotProductAttention {
  public:
-  TurboQuantScaledDotProductAttention(
-      Stream stream,
-      std::function<std::vector<array>(std::vector<array>)> fallback,
-      float scale,
-      bool do_causal,
-      int split_k_blocks,
-      float sparse_v_threshold,
-      bool output_diagnostics,
-      int backend_version)
-      : Custom(stream, std::move(fallback)),
-        scale_(scale),
-        do_causal_(do_causal),
-        split_k_blocks_(split_k_blocks),
-        sparse_v_threshold_(sparse_v_threshold),
-        output_diagnostics_(output_diagnostics),
-        backend_version_(backend_version) {}
-
-  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
-    throw TurboQuantNativeAttentionUnavailable(
-        "TurboQuantScaledDotProductAttention has no CPU implementation.");
-  }
-
-  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
-      override;
-
   static bool use_fallback(
       const array& q,
       bool is_training,
@@ -360,29 +335,6 @@ class TurboQuantScaledDotProductAttention : public Custom {
       bool native_enabled);
 
   static bool native_backend_available(Stream s);
-
-  bool is_equivalent(const Primitive& other) const override;
-
-  DEFINE_NAME(TurboQuantScaledDotProductAttention);
-  DEFINE_INPUT_OUTPUT_SHAPE()
-  auto state() const {
-    return std::make_tuple(
-        nullptr,
-        scale_,
-        do_causal_,
-        split_k_blocks_,
-        sparse_v_threshold_,
-        output_diagnostics_,
-        backend_version_);
-  }
-
- private:
-  float scale_;
-  bool do_causal_;
-  int split_k_blocks_;
-  float sparse_v_threshold_;
-  bool output_diagnostics_;
-  int backend_version_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {
