@@ -1,4 +1,6 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
+#include <optional>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -21,8 +23,38 @@ int select_sdpa_blocks(
     char devc,
     int N,
     int n_simds,
+    int q_seq_len,
     int head_dim,
+    int value_bits,
     [[maybe_unused]] bool quantized) {
+  if (quantized && q_seq_len <= 1) {
+    const char* env = std::getenv("TURBOQUANT_SDPA_DECODE_BLOCKS");
+    if (value_bits > 0) {
+      std::string value_bits_env_name =
+          "TURBOQUANT_SDPA_V" + std::to_string(value_bits) + "_DECODE_BLOCKS";
+      if (const char* value_bits_env = std::getenv(value_bits_env_name.c_str())) {
+        env = value_bits_env;
+      }
+    }
+    if (env != nullptr) {
+      int override_blocks = std::atoi(env);
+      if (override_blocks > 0) {
+        return override_blocks;
+      }
+    }
+  }
+
+  // Long decode with quantized K/V can otherwise leave each threadgroup scanning
+  // tens of thousands of tokens inside one Metal command buffer. Split the
+  // sequence more aggressively for decode-shaped calls so macOS does not abort
+  // the work as an interactivity hazard at 128K+ context.
+  if (quantized && q_seq_len <= 1 && N >= 32768) {
+    if (N <= 65536) {
+      return 512;
+    }
+    return 1024;
+  }
+
   if (devc == 's') {
     int blocks = 64;
     if (quantized && N >= 16384 && n_simds >= 4) {
@@ -512,7 +544,14 @@ void sdpa_vector_2pass(
   char devc = d.get_architecture().back();
   int N = k.shape(2);
   int blocks =
-      select_sdpa_blocks(devc, N, n_simds, q.shape(-1), /*quantized=*/false);
+      select_sdpa_blocks(
+          devc,
+          N,
+          n_simds,
+          q.shape(2),
+          q.shape(-1),
+          /*value_bits=*/0,
+          /*quantized=*/false);
 
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
@@ -678,7 +717,14 @@ void quant_sdpa_vector_2pass(
 
   char devc = d.get_architecture().back();
   int blocks =
-      select_sdpa_blocks(devc, N, n_simds, q.shape(-1), /*quantized=*/true);
+      select_sdpa_blocks(
+          devc,
+          N,
+          n_simds,
+          q.shape(2),
+          q.shape(-1),
+          value_bits,
+          /*quantized=*/true);
 
   // Head strides for quantized data (in uint32 units) and scales
   size_t k_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
@@ -814,6 +860,95 @@ void quant_sdpa_vector_2pass(
   group_dims = MTL::Size(1024, 1, 1);
   grid_dims = MTL::Size(q.shape(0) * q.shape(1), q.shape(2), 1);
   check_kernel_threadgroup_size(kernel, group_dims, kname);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void mixed_quant_sdpa_vector_sparse_decode(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& k_scales,
+    const std::optional<array>& k_biases,
+    const array& v,
+    const array& v_scales,
+    const std::optional<array>& v_biases,
+    array& out,
+    array& sparse_stats,
+    float scale,
+    float sparse_v_threshold,
+    int key_group_size,
+    int key_bits,
+    int value_group_size,
+    int value_bits,
+    QuantizationMode mode) {
+  std::string kname = "mixed_quant_sdpa_vector_sparse_decode_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+
+  int N = k.shape(2);
+  int num_kv_heads = k.shape(1);
+  int gqa_factor = q.shape(1) / num_kv_heads;
+
+  size_t k_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t v_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t k_group_stride =
+      k_scales.shape(1) == 1 ? k_scales.strides(0) : k_scales.strides(1);
+  size_t v_group_stride =
+      v_scales.shape(1) == 1 ? v_scales.strides(0) : v_scales.strides(1);
+
+  bool has_affine_bias = mode == QuantizationMode::Affine;
+  bool query_transposed = !q.flags().row_contiguous;
+  int quant_mode_int = quant_mode_to_int(mode);
+  metal::MTLFCList func_consts = {
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&has_affine_bias, MTL::DataType::DataTypeBool, 27},
+      {&quant_mode_int, MTL::DataType::DataTypeInt, 28},
+      {&key_bits, MTL::DataType::DataTypeInt, 29},
+      {&key_group_size, MTL::DataType::DataTypeInt, 30},
+      {&value_bits, MTL::DataType::DataTypeInt, 32},
+      {&value_group_size, MTL::DataType::DataTypeInt, 33},
+  };
+
+  std::string hash_name = kname;
+  hash_name += query_transposed ? "_qt" : "_qnt";
+  hash_name += has_affine_bias ? "_affine_" : "_noaffine_";
+  hash_name += std::to_string(quant_mode_int) + "_";
+  hash_name += std::to_string(key_bits) + "_";
+  hash_name += std::to_string(key_group_size) + "_";
+  hash_name += std::to_string(value_bits) + "_";
+  hash_name += std::to_string(value_group_size);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  MTL::Size group_dims(32, 1, 1);
+  MTL::Size grid_dims(q.shape(1), q.shape(0), 1);
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(k_scales, 2);
+  compute_encoder.set_input_array(v, 3);
+  compute_encoder.set_input_array(v_scales, 4);
+  compute_encoder.set_output_array(out, 5);
+  compute_encoder.set_output_array(sparse_stats, 6);
+  compute_encoder.set_bytes(N, 9);
+  compute_encoder.set_bytes(k_stride, 10);
+  compute_encoder.set_bytes(v_stride, 11);
+  compute_encoder.set_bytes(k_group_stride, 12);
+  compute_encoder.set_bytes(v_group_stride, 13);
+  compute_encoder.set_bytes(scale, 14);
+  compute_encoder.set_bytes(sparse_v_threshold, 15);
+  compute_encoder.set_bytes(gqa_factor, 16);
+  compute_encoder.set_bytes(num_kv_heads, 17);
+  if (has_affine_bias) {
+    compute_encoder.set_input_array(*k_biases, 20);
+    compute_encoder.set_input_array(*v_biases, 21);
+  }
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -1169,6 +1304,45 @@ void QuantizedScaledDotProductAttention::eval_gpu(
   }
 
   bool do_causal = do_causal_ && q.shape(2) > 1;
+  if ((sparse_v_threshold_ > 0.0f || output_diagnostics_) && is_affine &&
+      q.shape(2) == 1 &&
+      !has_arr_mask_ && !has_sinks_) {
+    std::optional<array> sparse_stats_holder;
+    array& sparse_stats = output_diagnostics_
+        ? outputs[1]
+        : sparse_stats_holder.emplace(
+              Shape{q.shape(0) * q.shape(1) * q.shape(2), 2},
+              uint32,
+              nullptr,
+              std::vector<array>{});
+    if (output_diagnostics_) {
+      sparse_stats.set_data(allocator::malloc(sparse_stats.nbytes()));
+    } else {
+      sparse_stats.set_data(allocator::malloc(sparse_stats.nbytes()));
+      metal::get_command_encoder(s).add_temporary(sparse_stats);
+    }
+    mixed_quant_sdpa_vector_sparse_decode(
+        s,
+        d,
+        q,
+        k,
+        k_scales,
+        k_biases,
+        v,
+        v_scales,
+        v_biases,
+        o,
+        sparse_stats,
+        scale_,
+        sparse_v_threshold_,
+        key_group_size_,
+        key_bits_,
+        value_group_size_,
+        value_bits_,
+        mode_);
+    metal::get_command_encoder(s).add_temporaries(std::move(copies));
+    return;
+  }
   quant_sdpa_vector_2pass(
       s,
       d,

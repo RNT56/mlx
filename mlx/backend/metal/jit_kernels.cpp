@@ -853,13 +853,17 @@ MTL::ComputePipelineState* get_quantized_kernel(
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
-    concatenate(
-        kernel_source,
-        metal::utils(),
-        metal::gemm(),
-        metal::quantized_utils(),
-        (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
-        template_def);
+    if (mode == "affine") {
+      concatenate(
+          kernel_source,
+          metal::utils(),
+          metal::gemm(),
+          metal::quantized_utils(),
+          metal::quantized(),
+          template_def);
+    } else {
+      concatenate(kernel_source, metal::utils(), metal::fp_quantized(), template_def);
+    }
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib);
@@ -883,24 +887,29 @@ MTL::ComputePipelineState* get_gather_qmm_kernel(
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
     std::string kernel_source;
-    concatenate(
-        kernel_source, metal::utils(), metal::quantized_utils(), metal::gemm());
     bool is_affine = mode == "affine";
-    concatenate(
-        kernel_source,
-        is_affine ? metal::quantized() : metal::fp_quantized(),
-        get_template_definition(
-            lib_name,
-            (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs"),
-            get_type_string(x.dtype()),
-            group_size,
-            bits,
-            bm,
-            bn,
-            bk,
-            wm,
-            wn,
-            transpose));
+    if (is_affine) {
+      concatenate(
+          kernel_source,
+          metal::utils(),
+          metal::quantized_utils(),
+          metal::gemm(),
+          metal::quantized());
+    } else {
+      concatenate(kernel_source, metal::utils(), metal::fp_quantized());
+    }
+    kernel_source += get_template_definition(
+        lib_name,
+        (is_affine ? "affine" : "fp") + std::string("_gather_qmm_rhs"),
+        get_type_string(x.dtype()),
+        group_size,
+        bits,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        transpose);
     return kernel_source;
   });
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);

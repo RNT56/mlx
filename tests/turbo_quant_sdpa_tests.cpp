@@ -34,7 +34,8 @@ struct TurboQuantTestInputs {
       6, 1, 1, 1, 1, 0, 0, 64, 1, 8, 2};
   fast::TurboQuantPrecisionPolicyDescriptor precision{
       35, 64, 3, 4, 500, 1000, 4, 3, 2, 8, 1, 2};
-  fast::TurboQuantAttentionOptions options{0.125f, true, 0, 0.0f, false, 3};
+  fast::TurboQuantAttentionOptions options{
+      0.125f, true, 0, 0.0f, 0, 0, 0.0f, 0, false, 3};
 };
 
 array call_turbo_quant_attention(

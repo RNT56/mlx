@@ -8,6 +8,8 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <cmath>
+
 #include "mlx/fast.h"
 #include "mlx/ops.h"
 #include "python/src/small_vector.h"
@@ -413,13 +415,41 @@ void init_fast(nb::module_& parent_module) {
          int value_bits,
          const std::string& mode,
          bool causal,
+         float sparse_v_threshold,
          mx::StreamOrDevice s) {
         if (mode != "affine") {
           std::ostringstream msg;
           msg << "[mixed_quantized_scaled_dot_product_attention] mode must be "
-                 "\"affine\" for the production K8/V4 native path but got \""
+                 "\"affine\" for the K8/Vx native path but got \""
               << mode << "\".";
           throw std::invalid_argument(msg.str());
+        }
+        if (!std::isfinite(sparse_v_threshold) ||
+            sparse_v_threshold < 0.0f) {
+          throw std::invalid_argument(
+              "[mixed_quantized_scaled_dot_product_attention] "
+              "sparse_v_threshold must be finite and non-negative.");
+        }
+        if (sparse_v_threshold > 0.0f) {
+          return mx::fast::
+              mixed_quantized_scaled_dot_product_attention_with_diagnostics(
+                  q,
+                  k,
+                  k_scales,
+                  k_biases,
+                  v,
+                  v_scales,
+                  v_biases,
+                  scale,
+                  mask,
+                  sinks,
+                  key_group_size,
+                  key_bits,
+                  value_group_size,
+                  value_bits,
+                  causal,
+                  sparse_v_threshold,
+                  s)[0];
         }
         return mx::fast::mixed_quantized_scaled_dot_product_attention(
             q,
@@ -456,15 +486,16 @@ void init_fast(nb::module_& parent_module) {
       "value_bits"_a = 4,
       "mode"_a = "affine",
       "causal"_a = false,
+      "sparse_v_threshold"_a = 0.0f,
       "stream"_a = nb::none(),
       nb::sig(
-          "def mixed_quantized_scaled_dot_product_attention(q: array, k: array, k_scales: array, k_biases: array, v: array, v_scales: array, v_biases: array, *, scale: float, mask: Optional[array] = None, sinks: Optional[array] = None, key_group_size: int = 64, key_bits: int = 8, value_group_size: int = 32, value_bits: int = 4, mode: str = \"affine\", causal: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
+          "def mixed_quantized_scaled_dot_product_attention(q: array, k: array, k_scales: array, k_biases: array, v: array, v_scales: array, v_biases: array, *, scale: float, mask: Optional[array] = None, sinks: Optional[array] = None, key_group_size: int = 64, key_bits: int = 8, value_group_size: int = 32, value_bits: int = 4, mode: str = \"affine\", causal: bool = False, sparse_v_threshold: float = 0.0, stream: Union[None, Stream, Device] = None) -> array"),
       R"pbdoc(
         A fast implementation of multi-head attention where keys and values are
         quantized with different bit widths and group sizes.
 
-        This is the native packed K/V path used for affine K8/V4 speed routes:
-        keys can remain at 8-bit while values use 4-bit storage, with QK,
+        This is the native packed K/V path used for affine K8/Vx speed routes:
+        keys remain at 8-bit while values can use 4-, 3-, or 2-bit storage, with QK,
         softmax, and AV fused without materializing full precision K/V.
 
         Args:
@@ -482,11 +513,91 @@ void init_fast(nb::module_& parent_module) {
             key_bits (int): Key bit width.
             value_group_size (int): Value quantization group size.
             value_bits (int): Value bit width.
-            mode (str): Quantization mode. Currently production K8/V4 uses ``"affine"``.
+            mode (str): Quantization mode. Currently K8/Vx uses ``"affine"``.
             causal (bool): Whether to apply lower-right aligned causal masking.
               Cannot be used together with ``mask``.
+            sparse_v_threshold (float): Sparse-V decode threshold. ``0``
+              keeps dense AV behavior; positive values skip V dequantization
+              for normalized attention weights below the threshold without
+              renormalizing.
         Returns:
             array: The output array.
+      )pbdoc");
+
+  m.def(
+      "mixed_quantized_scaled_dot_product_attention_with_diagnostics",
+      [](const mx::array& q,
+         const mx::array& k,
+         const mx::array& k_scales,
+         const std::optional<mx::array>& k_biases,
+         const mx::array& v,
+         const mx::array& v_scales,
+         const std::optional<mx::array>& v_biases,
+         float scale,
+         const std::optional<mx::array>& mask,
+         const std::optional<mx::array>& sinks,
+         int key_group_size,
+         int key_bits,
+         int value_group_size,
+         int value_bits,
+         const std::string& mode,
+         bool causal,
+         float sparse_v_threshold,
+         mx::StreamOrDevice s) {
+        if (mode != "affine") {
+          std::ostringstream msg;
+          msg << "[mixed_quantized_scaled_dot_product_attention_with_diagnostics] "
+                 "mode must be \"affine\" for the K8/Vx native path but got \""
+              << mode << "\".";
+          throw std::invalid_argument(msg.str());
+        }
+        return mx::fast::
+            mixed_quantized_scaled_dot_product_attention_with_diagnostics(
+                q,
+                k,
+                k_scales,
+                k_biases,
+                v,
+                v_scales,
+                v_biases,
+                scale,
+                mask,
+                sinks,
+                key_group_size,
+                key_bits,
+                value_group_size,
+                value_bits,
+                causal,
+                sparse_v_threshold,
+                s);
+      },
+      "q"_a,
+      "k"_a,
+      "k_scales"_a,
+      "k_biases"_a,
+      "v"_a,
+      "v_scales"_a,
+      "v_biases"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
+      "key_group_size"_a = 64,
+      "key_bits"_a = 8,
+      "value_group_size"_a = 32,
+      "value_bits"_a = 4,
+      "mode"_a = "affine",
+      "causal"_a = false,
+      "sparse_v_threshold"_a = 0.0f,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def mixed_quantized_scaled_dot_product_attention_with_diagnostics(q: array, k: array, k_scales: array, k_biases: array, v: array, v_scales: array, v_biases: array, *, scale: float, mask: Optional[array] = None, sinks: Optional[array] = None, key_group_size: int = 64, key_bits: int = 8, value_group_size: int = 32, value_bits: int = 4, mode: str = \"affine\", causal: bool = False, sparse_v_threshold: float = 0.0, stream: Union[None, Stream, Device] = None) -> list[array]"),
+      R"pbdoc(
+        Mixed affine K8/Vx scaled dot product attention with Sparse-V
+        diagnostics.
+
+        Returns ``[output, diagnostics]`` where diagnostics is uint32
+        ``[rows, 2]`` containing skipped and considered V-position counts.
       )pbdoc");
 
   m.def(
