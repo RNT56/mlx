@@ -76,6 +76,44 @@ array make_mixed_k8v4_sdpa(
       s);
 }
 
+std::vector<array> make_mixed_k8v4_sdpa_diagnostics(
+    int qsl,
+    int query_heads,
+    int kv_heads,
+    int key_sequence_length,
+    int head_dim,
+    float sparse_v_threshold,
+    Stream s = Stream(0, Device::gpu)) {
+  auto q = zeros({1, query_heads, qsl, head_dim}, float16);
+  auto k = zeros({1, kv_heads, key_sequence_length, head_dim / 4}, uint32);
+  auto k_scales = zeros({1, kv_heads, key_sequence_length, head_dim / 64},
+                        float16);
+  auto k_biases = zeros(k_scales.shape(), float16);
+  auto v = zeros({1, kv_heads, key_sequence_length, head_dim / 8}, uint32);
+  auto v_scales = zeros({1, kv_heads, key_sequence_length, head_dim / 32},
+                        float16);
+  auto v_biases = zeros(v_scales.shape(), float16);
+
+  return fast::mixed_quantized_scaled_dot_product_attention_with_diagnostics(
+      q,
+      k,
+      k_scales,
+      k_biases,
+      v,
+      v_scales,
+      v_biases,
+      1.0f,
+      std::nullopt,
+      std::nullopt,
+      64,
+      8,
+      32,
+      4,
+      false,
+      sparse_v_threshold,
+      s);
+}
+
 } // namespace
 
 TEST_CASE("quantized sdpa supports verifier batch shapes") {
@@ -97,7 +135,7 @@ TEST_CASE("quantized sdpa fallback rejects unsupported gate shapes") {
   CHECK(quantized_sdpa_uses_fallback(/* qsl = */ 9, /* gqa = */ 33, 128));
 }
 
-TEST_CASE("mixed K8/V4 native sdpa rejects unsupported native shapes") {
+TEST_CASE("mixed K8/Vx native sdpa rejects unsupported native shapes") {
   CHECK_THROWS_AS(
       make_mixed_k8v4_sdpa(
           /* qsl = */ 33,
@@ -124,7 +162,22 @@ TEST_CASE("mixed K8/V4 native sdpa rejects unsupported native shapes") {
       std::invalid_argument);
 }
 
-TEST_CASE("mixed K8/V4 native sdpa rejects non-K8V4 bit widths") {
+TEST_CASE("mixed K8/Vx native sdpa accepts lower value bit widths") {
+  for (int value_bits : {2, 3, 4}) {
+    CHECK_NOTHROW(make_mixed_k8v4_sdpa(
+        /* qsl = */ 1,
+        /* query_heads = */ 1,
+        /* kv_heads = */ 1,
+        /* key_sequence_length = */ 64,
+        /* head_dim = */ 64,
+        /* key_group_size = */ 64,
+        /* key_bits = */ 8,
+        /* value_group_size = */ 32,
+        value_bits));
+  }
+}
+
+TEST_CASE("mixed K8/Vx native sdpa rejects unsupported bit widths") {
   CHECK_THROWS_AS(
       make_mixed_k8v4_sdpa(
           /* qsl = */ 1,
@@ -136,5 +189,41 @@ TEST_CASE("mixed K8/V4 native sdpa rejects non-K8V4 bit widths") {
           /* key_bits = */ 4,
           /* value_group_size = */ 64,
           /* value_bits = */ 4),
+      std::invalid_argument);
+  CHECK_THROWS_AS(
+      make_mixed_k8v4_sdpa(
+          /* qsl = */ 1,
+          /* query_heads = */ 1,
+          /* kv_heads = */ 1,
+          /* key_sequence_length = */ 64,
+          /* head_dim = */ 64,
+          /* key_group_size = */ 64,
+          /* key_bits = */ 8,
+          /* value_group_size = */ 64,
+          /* value_bits = */ 8),
+      std::invalid_argument);
+}
+
+TEST_CASE("mixed K8/Vx sparse diagnostics output contract") {
+  auto outputs = make_mixed_k8v4_sdpa_diagnostics(
+      /* qsl = */ 1,
+      /* query_heads = */ 2,
+      /* kv_heads = */ 1,
+      /* key_sequence_length = */ 64,
+      /* head_dim = */ 64,
+      /* sparse_v_threshold = */ 1e-6f);
+  REQUIRE(outputs.size() == 2);
+  CHECK(outputs[0].shape() == Shape{1, 2, 1, 64});
+  CHECK(outputs[1].shape() == Shape{2, 2});
+  CHECK(outputs[1].dtype() == uint32);
+
+  CHECK_THROWS_AS(
+      make_mixed_k8v4_sdpa_diagnostics(
+          /* qsl = */ 2,
+          /* query_heads = */ 2,
+          /* kv_heads = */ 1,
+          /* key_sequence_length = */ 64,
+          /* head_dim = */ 64,
+          /* sparse_v_threshold = */ 1e-6f),
       std::invalid_argument);
 }

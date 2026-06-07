@@ -65,6 +65,11 @@ instantiate_quant_sdpa_vector_heads(float16_t)
       "mixed_quant_sdpa_vector_2pass_1_" #type "_" #qk_dim "_" #value_dim,   \
       mixed_quant_sdpa_vector_2pass_1,                                       \
       type,                                                                  \
+      qk_dim)                                                                \
+  instantiate_kernel(                                                        \
+      "mixed_quant_sdpa_vector_sparse_decode_" #type "_" #qk_dim "_" #value_dim, \
+      mixed_quant_sdpa_vector_sparse_decode,                                 \
+      type,                                                                  \
       qk_dim)
 
 #define instantiate_mixed_quant_sdpa_vector_heads(type) \

@@ -34,7 +34,8 @@ struct TurboQuantTestInputs {
       6, 1, 1, 1, 1, 0, 0, 64, 1, 8, 2};
   fast::TurboQuantPrecisionPolicyDescriptor precision{
       35, 64, 3, 4, 500, 1000, 4, 3, 2, 8, 1, 2};
-  fast::TurboQuantAttentionOptions options{0.125f, true, 0, 0.0f, false, 3};
+  fast::TurboQuantAttentionOptions options{
+      0.125f, true, 0, 0.0f, 0, 0, 0.0f, 0, false, 3};
 };
 
 array call_turbo_quant_attention(
@@ -71,6 +72,22 @@ TEST_CASE("turbo quant segmented attention reports no native backend on CPU") {
       fast::turbo_quant_segmented_attention_is_available(false, Device::cpu));
   CHECK_FALSE(
       fast::turbo_quant_segmented_attention_is_available(true, Device::cpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarQJL,
+          false,
+          Device::cpu),
+      fast::turbo_quant_segmented_attention_backend(false, Device::cpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarWHT,
+          true,
+          Device::cpu),
+      fast::TurboQuantSegmentedAttentionBackend::Unavailable);
+  CHECK_FALSE(fast::turbo_quant_segmented_attention_is_available_for_codec(
+      fast::TurboQuantSegmentedAttentionCodec::HybridK8PolarWHTValue,
+      true,
+      Device::cpu));
 }
 
 TEST_CASE("turbo quant segmented attention reports production Metal backend") {
@@ -87,6 +104,22 @@ TEST_CASE("turbo quant segmented attention reports production Metal backend") {
       fast::TurboQuantSegmentedAttentionBackend::NativeFused);
   CHECK(
       fast::turbo_quant_segmented_attention_is_available(true, Device::gpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarQJL,
+          false,
+          Device::gpu),
+      fast::TurboQuantSegmentedAttentionBackend::NativeFused);
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarWHT,
+          true,
+          Device::gpu),
+      fast::TurboQuantSegmentedAttentionBackend::Unavailable);
+  CHECK_FALSE(fast::turbo_quant_segmented_attention_is_available_for_codec(
+      fast::TurboQuantSegmentedAttentionCodec::HybridK8PolarWHTValue,
+      true,
+      Device::gpu));
 }
 
 TEST_CASE("turbo quant native attention validates query rank and q length") {

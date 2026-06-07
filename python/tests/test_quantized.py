@@ -872,7 +872,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     tol = 2e-2
                 self.assertLess((out - ref).abs().max(), tol)
 
-    def test_mixed_quantized_sdpa_affine_k8_v4(self):
+    def test_mixed_quantized_sdpa_affine_k8_vx(self):
         if mx.default_device() == mx.cpu:
             self.skipTest("Quantized fast attention is only available on GPU.")
 
@@ -886,29 +886,87 @@ class TestQuantized(mlx_tests.MLXTestCase):
         k_q, k_scales, k_biases = mx.quantize(
             k, group_size=64, bits=8, mode="affine"
         )
-        v_q, v_scales, v_biases = mx.quantize(
-            v, group_size=32, bits=4, mode="affine"
-        )
-
         ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0)
+        for value_bits, tol in [(4, 5e-2), (3, 8e-2), (2, 1.5e-1)]:
+            v_q, v_scales, v_biases = mx.quantize(
+                v, group_size=32, bits=value_bits, mode="affine"
+            )
+            out = mx.fast.mixed_quantized_scaled_dot_product_attention(
+                q,
+                k_q,
+                k_scales,
+                k_biases,
+                v_q,
+                v_scales,
+                v_biases,
+                scale=1.0,
+                mode="affine",
+                key_group_size=64,
+                key_bits=8,
+                value_group_size=32,
+                value_bits=value_bits,
+            )
+
+            self.assertEqual(out.shape, ref.shape)
+            self.assertLess((out - ref).abs().max(), tol)
+
+    def test_mixed_quantized_sdpa_sparse_v_threshold(self):
+        if mx.default_device() == mx.cpu:
+            self.skipTest("Mixed quantized Sparse-V attention is only available on GPU.")
+
+        q = mx.zeros((1, 1, 1, 64), dtype=mx.float32)
+        packed_keys = mx.zeros((1, 1, 1, 16), dtype=mx.uint32)
+        packed_values = mx.zeros((1, 1, 1, 8), dtype=mx.uint32)
+        key_scales = mx.zeros((1, 1, 1, 1), dtype=mx.float32)
+        key_biases = mx.zeros((1, 1, 1, 1), dtype=mx.float32)
+        value_scales = mx.zeros((1, 1, 1, 2), dtype=mx.float32)
+        value_biases = mx.zeros((1, 1, 1, 2), dtype=mx.float32)
+
         out = mx.fast.mixed_quantized_scaled_dot_product_attention(
             q,
-            k_q,
-            k_scales,
-            k_biases,
-            v_q,
-            v_scales,
-            v_biases,
+            packed_keys,
+            key_scales,
+            key_biases,
+            packed_values,
+            value_scales,
+            value_biases,
             scale=1.0,
             mode="affine",
-            key_group_size=64,
-            key_bits=8,
-            value_group_size=32,
-            value_bits=4,
+            sparse_v_threshold=1e-6,
         )
+        self.assertEqual(out.shape, (1, 1, 1, 64))
 
-        self.assertEqual(out.shape, ref.shape)
-        self.assertLess((out - ref).abs().max(), 5e-2)
+        out, diagnostics = (
+            mx.fast.mixed_quantized_scaled_dot_product_attention_with_diagnostics(
+                q,
+                packed_keys,
+                key_scales,
+                key_biases,
+                packed_values,
+                value_scales,
+                value_biases,
+                scale=1.0,
+                mode="affine",
+                sparse_v_threshold=2.0,
+            )
+        )
+        self.assertEqual(out.shape, (1, 1, 1, 64))
+        self.assertEqual(diagnostics.shape, (1, 2))
+        self.assertTrue(mx.all(diagnostics == mx.array([[1, 1]], dtype=mx.uint32)))
+
+        with self.assertRaises(ValueError):
+            mx.fast.mixed_quantized_scaled_dot_product_attention(
+                q,
+                packed_keys,
+                key_scales,
+                key_biases,
+                packed_values,
+                value_scales,
+                value_biases,
+                scale=1.0,
+                mode="affine",
+                sparse_v_threshold=-1e-6,
+            )
 
     def test_quantized_sdpa_masked(self):
         if mx.default_device() == mx.cpu:

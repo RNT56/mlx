@@ -274,7 +274,9 @@ class QuantizedScaledDotProductAttention : public Custom {
       int key_bits,
       int value_group_size,
       int value_bits,
-      QuantizationMode mode)
+      QuantizationMode mode,
+      float sparse_v_threshold = 0.0f,
+      bool output_diagnostics = false)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         has_arr_mask_(has_arr_mask),
@@ -284,7 +286,9 @@ class QuantizedScaledDotProductAttention : public Custom {
         key_bits_(key_bits),
         value_group_size_(value_group_size),
         value_bits_(value_bits),
-        mode_(mode) {}
+        mode_(mode),
+        sparse_v_threshold_(sparse_v_threshold),
+        output_diagnostics_(output_diagnostics) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("NYI");
@@ -299,7 +303,16 @@ class QuantizedScaledDotProductAttention : public Custom {
   bool is_equivalent(const Primitive& other) const override;
 
   DEFINE_NAME(QuantizedScaledDotProductAttention);
-  DEFINE_INPUT_OUTPUT_SHAPE()
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    auto out_shape = inputs[0].shape();
+    int value_index = mode_ == QuantizationMode::Affine ? 4 : 3;
+    out_shape.back() = (inputs[value_index].shape(-1) * 32) / value_bits_;
+    if (!output_diagnostics_) {
+      return {std::move(out_shape)};
+    }
+    int row_count = inputs[0].shape(0) * inputs[0].shape(1) * inputs[0].shape(2);
+    return {std::move(out_shape), Shape{row_count, 2}};
+  }
   auto state() const {
     return std::make_tuple(
         nullptr,
@@ -311,7 +324,9 @@ class QuantizedScaledDotProductAttention : public Custom {
         key_bits_,
         value_group_size_,
         value_bits_,
-        mode_);
+        mode_,
+        sparse_v_threshold_,
+        output_diagnostics_);
   }
 
  private:
@@ -324,6 +339,8 @@ class QuantizedScaledDotProductAttention : public Custom {
   int value_group_size_;
   int value_bits_;
   QuantizationMode mode_;
+  float sparse_v_threshold_;
+  bool output_diagnostics_;
 };
 
 class TurboQuantScaledDotProductAttention {
