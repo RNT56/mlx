@@ -17,7 +17,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
-  const array& x = inputs[0];
+  array x = ensure_row_contiguous(inputs[0], encoder, s);
   const array& w = inputs[1];
   const array& scales = inputs[2];
   std::optional<array> biases;
@@ -84,7 +84,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     if (can_use_fp_qmv) {
       fp_qmv(x, w, scales, out, bits_, group_size_, encoder, s);
     } else {
-      qmv(x, w, scales, biases, out, bits_, group_size_, mode_, encoder);
+      qmv(x,
+          w,
+          scales,
+          biases,
+          std::nullopt,
+          out,
+          bits_,
+          group_size_,
+          mode_,
+          encoder);
     }
   };
 
@@ -146,15 +155,17 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
-  const array& x = inputs[0];
+  array x = ensure_row_contiguous(inputs[0], encoder, s);
   const array& w = inputs[1];
   const array& scales = inputs[2];
   std::optional<array> biases;
   if (inputs.size() == 6) {
     biases = inputs[3];
   }
-  array lhs_indices = ensure_contiguous(inputs[inputs.size() - 2], encoder, s);
-  array rhs_indices = ensure_contiguous(inputs[inputs.size() - 1], encoder, s);
+  array lhs_indices =
+      ensure_row_contiguous(inputs[inputs.size() - 2], encoder, s);
+  array rhs_indices =
+      ensure_row_contiguous(inputs[inputs.size() - 1], encoder, s);
 
   int M = out.ndim() > 1 ? out.shape(-2) : 1;
   int N = out.shape(-1);

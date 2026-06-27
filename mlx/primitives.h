@@ -550,6 +550,7 @@ class GatherMM : public UnaryPrimitive {
 
   DEFINE_NAME(GatherMM)
   bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   auto state() const {
     return std::make_pair(left_sorted_, right_sorted_);
   }
@@ -1707,6 +1708,7 @@ class GatherQMM : public UnaryPrimitive {
   DEFINE_GRADS()
   DEFINE_NAME(GatherQMM)
   bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
   auto state() const {
     return std::make_tuple(
         group_size_, bits_, mode_, transpose_, left_sorted_, right_sorted_);

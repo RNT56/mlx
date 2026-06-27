@@ -18,6 +18,13 @@ namespace mlx::core::fast {
 
 namespace {
 
+int apply_sdpa_blocks_override(int blocks) {
+  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
+    return blocks_env;
+  }
+  return blocks;
+}
+
 // Select block count for vector 2-pass attention kernels.
 int select_sdpa_blocks(
     char devc,
@@ -50,9 +57,9 @@ int select_sdpa_blocks(
   // the work as an interactivity hazard at 128K+ context.
   if (quantized && q_seq_len <= 1 && N >= 32768) {
     if (N <= 65536) {
-      return 512;
+      return apply_sdpa_blocks_override(512);
     }
-    return 1024;
+    return apply_sdpa_blocks_override(1024);
   }
 
   if (devc == 's') {
@@ -74,7 +81,7 @@ int select_sdpa_blocks(
         blocks = 1024;
       }
     }
-    return blocks;
+    return apply_sdpa_blocks_override(blocks);
   }
 
   if (devc == 'd') {
@@ -88,32 +95,32 @@ int select_sdpa_blocks(
         blocks = 1024;
       }
     }
-    return blocks;
+    return apply_sdpa_blocks_override(blocks);
   }
 
   if (devc == 'g' || devc == 'p') {
     if (n_simds <= 1) {
       if (N <= 2048) {
-        return 32;
+        return apply_sdpa_blocks_override(32);
       } else if (N <= 8192) {
-        return 64;
+        return apply_sdpa_blocks_override(64);
       } else {
-        return 128;
+        return apply_sdpa_blocks_override(128);
       }
     }
     if (head_dim >= 128) {
-      return 32;
+      return apply_sdpa_blocks_override(32);
     }
     if (N <= 8192) {
-      return 32;
+      return apply_sdpa_blocks_override(32);
     } else if (N <= 32768) {
-      return 64;
+      return apply_sdpa_blocks_override(64);
     } else {
-      return 128;
+      return apply_sdpa_blocks_override(128);
     }
   }
 
-  return (n_simds >= 4) ? 64 : 32;
+  return apply_sdpa_blocks_override((n_simds >= 4) ? 64 : 32);
 }
 
 void sdpa_full_self_attention_nax(
@@ -552,7 +559,6 @@ void sdpa_vector_2pass(
           q.shape(-1),
           /*value_bits=*/0,
           /*quantized=*/false);
-
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
   size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
