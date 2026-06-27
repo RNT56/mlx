@@ -1787,6 +1787,20 @@ TurboQuantSegmentedAttentionBackend tq_segmented_attention_backend(
   return TurboQuantSegmentedAttentionBackend::Unavailable;
 }
 
+TurboQuantSegmentedAttentionBackend tq_segmented_attention_backend_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
+    bool allow_experimental_jit,
+    Stream stream) {
+  switch (codec) {
+    case TurboQuantSegmentedAttentionCodec::PolarQJL:
+      return tq_segmented_attention_backend(allow_experimental_jit, stream);
+    case TurboQuantSegmentedAttentionCodec::PolarWHT:
+    case TurboQuantSegmentedAttentionCodec::HybridK8PolarWHTValue:
+    default:
+      return TurboQuantSegmentedAttentionBackend::Unavailable;
+  }
+}
+
 void check_tq_rank(const array& x, std::string_view name, int rank) {
   if (x.ndim() != rank) {
     std::ostringstream msg;
@@ -4113,6 +4127,24 @@ bool turbo_quant_segmented_attention_is_available(
     bool allow_experimental_jit,
     StreamOrDevice s) {
   return turbo_quant_segmented_attention_backend(allow_experimental_jit, s) !=
+      TurboQuantSegmentedAttentionBackend::Unavailable;
+}
+
+TurboQuantSegmentedAttentionBackend
+turbo_quant_segmented_attention_backend_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
+    bool allow_experimental_jit,
+    StreamOrDevice s) {
+  return tq_segmented_attention_backend_for_codec(
+      codec, allow_experimental_jit, to_stream(s));
+}
+
+bool turbo_quant_segmented_attention_is_available_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
+    bool allow_experimental_jit,
+    StreamOrDevice s) {
+  return turbo_quant_segmented_attention_backend_for_codec(
+             codec, allow_experimental_jit, s) !=
       TurboQuantSegmentedAttentionBackend::Unavailable;
 }
 

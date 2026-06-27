@@ -185,6 +185,11 @@ constant int quant_group_size [[function_constant(30)]];
 constant int quant_q_seq_len [[function_constant(31)]];
 constant int value_quant_bits [[function_constant(32)]];
 constant int value_quant_group_size [[function_constant(33)]];
+// §3a ghost-kernel decomposition (diagnostic; 0=full/production, 2=math-only). When 2,
+// the per-key K/V code/scale/bias pointers do NOT advance, so the full dequant math runs
+// against L1-resident loads — isolating ALU+launch from DRAM streaming. Default 0 keeps
+// production byte-identical (its own compiled pipeline variant via the hash name).
+constant int ghost_mode [[function_constant(40)]];
 
 template <int group_size, int elem_per_thread, int granularity>
 struct GroupSlice {
@@ -871,7 +876,13 @@ METAL_FUNC void mixed_quant_sdpa_vector_2pass_1_impl(
   const bool all_keys_visible =
       !bool_mask && !float_mask && (!do_causal || q_seq_len == 1);
   if (all_keys_visible) {
-    for (int i = block_idx * BN + local_quad_gid; i < N; i += blocks * BN) {
+    // §3a ghost_mode==3 (launch-only): skip ALL per-key work but keep the identical
+    // grid/ladder/setup + the pass-2 merge dispatch, isolating launch+dispatch+merge
+    // overhead from per-key (ALU+LSU) cost. Function constant => compile-time per
+    // pipeline => zero overhead for modes 0/2. If the launch share GROWS with N, the
+    // ladder/merge path is the lever (not simdgroups-per-threadgroup).
+    for (int i = block_idx * BN + local_quad_gid; (ghost_mode != 3) && i < N;
+         i += blocks * BN) {
       U score = QuantOps<mode, key_bits, key_group_size>::
           template dot<U, ScaleT, elem_per_thread>(
               q, key_ptr.ptr(), key_scales, key_bias_ptr);
@@ -900,13 +911,19 @@ METAL_FUNC void mixed_quant_sdpa_vector_2pass_1_impl(
               value_scales,
               value_bias_ptr);
 
-      key_ptr.advance(data_step);
-      value_ptr.advance(data_step);
-      key_scales += key_scale_step;
-      value_scales += value_scale_step;
-      if constexpr (Cfg::has_bias) {
-        key_bias_ptr += key_scale_step;
-        value_bias_ptr += value_scale_step;
+      // §3a math-only (ghost_mode==2): hold the pointers so loads stay L1-resident
+      // (no DRAM streaming) while the codec math runs every iteration — isolates the
+      // ALU+launch cost from the bandwidth cost. ghost_mode==0 (default) advances
+      // normally and is byte-identical to production.
+      if (ghost_mode != 2) {
+        key_ptr.advance(data_step);
+        value_ptr.advance(data_step);
+        key_scales += key_scale_step;
+        value_scales += value_scale_step;
+        if constexpr (Cfg::has_bias) {
+          key_bias_ptr += key_scale_step;
+          value_bias_ptr += value_scale_step;
+        }
       }
     }
   } else {

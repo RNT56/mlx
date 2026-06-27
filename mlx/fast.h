@@ -179,12 +179,29 @@ enum class TurboQuantSegmentedAttentionBackend : int {
   NativeFused = 2,
 };
 
+enum class TurboQuantSegmentedAttentionCodec : int {
+  PolarQJL = 0,
+  PolarWHT = 1,
+  HybridK8PolarWHTValue = 2,
+};
+
 MLX_API TurboQuantSegmentedAttentionBackend
 turbo_quant_segmented_attention_backend(
     bool allow_experimental_jit = false,
     StreamOrDevice s = {});
 
 MLX_API bool turbo_quant_segmented_attention_is_available(
+    bool allow_experimental_jit = false,
+    StreamOrDevice s = {});
+
+MLX_API TurboQuantSegmentedAttentionBackend
+turbo_quant_segmented_attention_backend_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
+    bool allow_experimental_jit = false,
+    StreamOrDevice s = {});
+
+MLX_API bool turbo_quant_segmented_attention_is_available_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
     bool allow_experimental_jit = false,
     StreamOrDevice s = {});
 

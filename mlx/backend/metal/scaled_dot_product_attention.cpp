@@ -764,6 +764,16 @@ void quant_sdpa_vector_2pass(
   bool has_sinks = sinks.has_value();
   bool has_affine_bias = mode == QuantizationMode::Affine;
   int quant_mode_int = quant_mode_to_int(mode);
+  // §3a ghost-kernel decomposition (diagnostic; default 0 = production, byte-identical).
+  // 2 = math-only: the kernel runs the full dequant/dot/accumulate but does NOT advance
+  // the K/V code+scale+bias pointers, so loads collapse to L1 after the first key —
+  // isolating ALU+launch from DRAM streaming. full vs math-only brackets the affine
+  // bandwidth gap (full >> math-only => DRAM-bound, ALU headroom for a heavier codec;
+  // full ~= math-only => launch/compute-bound). Env-driven (matches TURBOQUANT_SDPA_*).
+  int ghost_mode = 0;
+  if (const char* gm = std::getenv("TURBOQUANT_GHOST_SDPA_MODE")) {
+    ghost_mode = std::atoi(gm);
+  }
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -777,6 +787,7 @@ void quant_sdpa_vector_2pass(
       {&key_bits, MTL::DataType::DataTypeInt, 29},
       {&key_group_size, MTL::DataType::DataTypeInt, 30},
       {&q_seq_len, MTL::DataType::DataTypeInt, 31},
+      {&ghost_mode, MTL::DataType::DataTypeInt, 40},
   };
   if (mixed_quantization) {
     func_consts.push_back({&value_bits, MTL::DataType::DataTypeInt, 32});
@@ -796,6 +807,9 @@ void quant_sdpa_vector_2pass(
   hash_name += std::to_string(value_group_size) + "_";
   hash_name += std::to_string(q_seq_len) + "_";
   hash_name += std::to_string(blocks);
+  if (ghost_mode != 0) {
+    hash_name += "_ghost" + std::to_string(ghost_mode);
+  }
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.add_temporary(intermediate);

@@ -72,6 +72,22 @@ TEST_CASE("turbo quant segmented attention reports no native backend on CPU") {
       fast::turbo_quant_segmented_attention_is_available(false, Device::cpu));
   CHECK_FALSE(
       fast::turbo_quant_segmented_attention_is_available(true, Device::cpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarQJL,
+          false,
+          Device::cpu),
+      fast::turbo_quant_segmented_attention_backend(false, Device::cpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarWHT,
+          true,
+          Device::cpu),
+      fast::TurboQuantSegmentedAttentionBackend::Unavailable);
+  CHECK_FALSE(fast::turbo_quant_segmented_attention_is_available_for_codec(
+      fast::TurboQuantSegmentedAttentionCodec::HybridK8PolarWHTValue,
+      true,
+      Device::cpu));
 }
 
 TEST_CASE("turbo quant segmented attention reports production Metal backend") {
@@ -88,6 +104,22 @@ TEST_CASE("turbo quant segmented attention reports production Metal backend") {
       fast::TurboQuantSegmentedAttentionBackend::NativeFused);
   CHECK(
       fast::turbo_quant_segmented_attention_is_available(true, Device::gpu));
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarQJL,
+          false,
+          Device::gpu),
+      fast::TurboQuantSegmentedAttentionBackend::NativeFused);
+  CHECK_EQ(
+      fast::turbo_quant_segmented_attention_backend_for_codec(
+          fast::TurboQuantSegmentedAttentionCodec::PolarWHT,
+          true,
+          Device::gpu),
+      fast::TurboQuantSegmentedAttentionBackend::Unavailable);
+  CHECK_FALSE(fast::turbo_quant_segmented_attention_is_available_for_codec(
+      fast::TurboQuantSegmentedAttentionCodec::HybridK8PolarWHTValue,
+      true,
+      Device::gpu));
 }
 
 TEST_CASE("turbo quant native attention validates query rank and q length") {
