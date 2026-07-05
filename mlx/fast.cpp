@@ -1767,6 +1767,231 @@ std::vector<array> mixed_quantized_scaled_dot_product_attention_with_diagnostics
       s);
 }
 
+std::vector<array> quantize_append_kv(
+    const array& k_new,
+    const array& v_new,
+    const array& k_codes,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_codes,
+    const array& v_scales,
+    const array& v_biases,
+    int seq_offset,
+    int steps,
+    int key_group_size,
+    int key_bits,
+    int value_group_size,
+    int value_bits,
+    StreamOrDevice s /* = {} */) {
+  constexpr const char* tag = "quantize_append_kv";
+
+  // Supported specialization set: K8/gs{64,128}, V4/gs{32,64,128}, power-of-two
+  // bits only (the 3/5/6-bit byte-splitting branches are intentionally not
+  // ported). Anything else fails closed with an invalid_argument.
+  if (key_bits != 8 || (key_group_size != 64 && key_group_size != 128)) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] only key_bits=8 with key_group_size in {64,128} is supported; "
+           "received key_bits="
+        << key_bits << ", key_group_size=" << key_group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (value_bits != 4 ||
+      (value_group_size != 32 && value_group_size != 64 &&
+       value_group_size != 128)) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] only value_bits=4 with value_group_size in {32,64,128} is "
+           "supported; received value_bits="
+        << value_bits << ", value_group_size=" << value_group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto final_type = k_new.dtype();
+  if (!(final_type == float16 || final_type == bfloat16 ||
+        final_type == float32)) {
+    std::ostringstream msg;
+    msg << "[" << tag
+        << "] k_new must be float16, bfloat16, or float32; received "
+        << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_new.dtype() != final_type) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] v_new dtype " << v_new.dtype()
+        << " must match k_new dtype " << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  for (const auto& t : {k_new, v_new}) {
+    if (t.ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] incoming rows with shape " << t.shape()
+          << " expected to be rank 4 [B, n_kv_heads, steps, head_dim].";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  for (const auto& t : {k_codes, k_scales, k_biases, v_codes, v_scales,
+                        v_biases}) {
+    if (t.ndim() != 4) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] cache plane with shape " << t.shape()
+          << " expected to be rank 4.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  if (k_codes.dtype() != uint32 || v_codes.dtype() != uint32) {
+    throw std::invalid_argument(
+        "[quantize_append_kv] code planes must be uint32.");
+  }
+  if (k_scales.dtype() != final_type || k_biases.dtype() != final_type ||
+      v_scales.dtype() != final_type || v_biases.dtype() != final_type) {
+    throw std::invalid_argument(
+        "[quantize_append_kv] scale/bias planes must match k_new dtype.");
+  }
+
+  if (steps <= 0 || seq_offset < 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] steps must be positive and seq_offset "
+        << "non-negative; received steps=" << steps
+        << ", seq_offset=" << seq_offset << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto key_head_dim = k_new.shape(-1);
+  auto value_head_dim = v_new.shape(-1);
+  if (key_head_dim % key_group_size != 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] key head_dim=" << key_head_dim
+        << " must be divisible by key_group_size=" << key_group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (value_head_dim % value_group_size != 0) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] value head_dim=" << value_head_dim
+        << " must be divisible by value_group_size=" << value_group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Incoming rows must carry exactly `steps` rows on the sequence axis (dim -2).
+  if (k_new.shape(-2) != steps || v_new.shape(-2) != steps) {
+    std::ostringstream msg;
+    msg << "[" << tag << "] k_new/v_new seq axis must equal steps=" << steps
+        << " but got k_new=" << k_new.shape(-2)
+        << ", v_new=" << v_new.shape(-2) << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Validate plane geometry: codes packed head_dim*bits/32, scales/biases
+  // head_dim/group_size, and matching batch/head dims and capacity headroom.
+  auto check_plane = [&](const array& plane,
+                         const char* which,
+                         int head_dim,
+                         int last_dim) {
+    if (plane.shape(0) != k_new.shape(0) ||
+        plane.shape(1) != k_new.shape(1)) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << which << " batch/head dims "
+          << plane.shape() << " must match k_new " << k_new.shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (plane.shape(-1) != last_dim) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << which << " last dim " << plane.shape(-1)
+          << " expected " << last_dim << " for head_dim=" << head_dim << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (seq_offset + steps > plane.shape(-2)) {
+      std::ostringstream msg;
+      msg << "[" << tag << "] " << which << " capacity " << plane.shape(-2)
+          << " too small for seq_offset+steps=" << (seq_offset + steps) << ".";
+      throw std::invalid_argument(msg.str());
+    }
+  };
+  int key_words = key_head_dim * key_bits / 32;
+  int key_groups = key_head_dim / key_group_size;
+  int value_words = value_head_dim * value_bits / 32;
+  int value_groups = value_head_dim / value_group_size;
+  check_plane(k_codes, "k_codes", key_head_dim, key_words);
+  check_plane(k_scales, "k_scales", key_head_dim, key_groups);
+  check_plane(k_biases, "k_biases", key_head_dim, key_groups);
+  check_plane(v_codes, "v_codes", value_head_dim, value_words);
+  check_plane(v_scales, "v_scales", value_head_dim, value_groups);
+  check_plane(v_biases, "v_biases", value_head_dim, value_groups);
+
+  // Bit-identical fallback: express the exact per-tensor quantize +
+  // slice_update ladder in ops. Used off-GPU and when TQ_QAPPEND=0.
+  auto fallback = [seq_offset,
+                   steps,
+                   key_group_size,
+                   key_bits,
+                   value_group_size,
+                   value_bits,
+                   key_words,
+                   key_groups,
+                   value_words,
+                   value_groups,
+                   s](const std::vector<array>& inputs) -> std::vector<array> {
+    const auto& kn = inputs[0];
+    const auto& vn = inputs[1];
+    auto kq = quantize(kn, key_group_size, key_bits, "affine", std::nullopt, s);
+    auto vq =
+        quantize(vn, value_group_size, value_bits, "affine", std::nullopt, s);
+
+    auto update_plane = [&](const array& plane,
+                            const array& update,
+                            int last_dim) {
+      Shape start(plane.ndim(), 0);
+      start[plane.ndim() - 2] = seq_offset;
+      Shape stop = plane.shape();
+      stop[plane.ndim() - 2] = seq_offset + steps;
+      stop[plane.ndim() - 1] = last_dim;
+      return slice_update(plane, update, std::move(start), std::move(stop), s);
+    };
+
+    std::vector<array> out;
+    out.reserve(6);
+    out.push_back(update_plane(inputs[2], kq[0], key_words)); // k_codes
+    out.push_back(update_plane(inputs[3], kq[1], key_groups)); // k_scales
+    out.push_back(update_plane(inputs[4], kq[2], key_groups)); // k_biases
+    out.push_back(update_plane(inputs[5], vq[0], value_words)); // v_codes
+    out.push_back(update_plane(inputs[6], vq[1], value_groups)); // v_scales
+    out.push_back(update_plane(inputs[7], vq[2], value_groups)); // v_biases
+    return out;
+  };
+
+  std::vector<array> inputs = {
+      k_new, v_new, k_codes, k_scales, k_biases, v_codes, v_scales, v_biases};
+
+  // TQ_QAPPEND=0 is a fail-closed kill switch that returns the bit-identical op
+  // ladder directly (observable as a different graph shape). Default (unset or
+  // any value != "0") uses the fused primitive.
+  if (const char* env = std::getenv("TQ_QAPPEND");
+      env && std::string_view(env) == "0") {
+    return fallback(inputs);
+  }
+
+  auto stream = to_stream(s);
+  auto primitive = std::make_shared<QuantizeAppendKV>(
+      stream,
+      fallback,
+      seq_offset,
+      steps,
+      key_group_size,
+      key_bits,
+      value_group_size,
+      value_bits);
+  return array::make_arrays(
+      {k_codes.shape(),
+       k_scales.shape(),
+       k_biases.shape(),
+       v_codes.shape(),
+       v_scales.shape(),
+       v_biases.shape()},
+      {uint32, final_type, final_type, uint32, final_type, final_type},
+      primitive,
+      inputs);
+}
+
 namespace {
 
 constexpr const char* tq_sdpa_tag = "turbo_quant_segmented_attention";
@@ -4659,6 +4884,30 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
       return {std::move(wq_shape), std::move(sshape), std::move(bshape)};
     }
   }
+}
+
+bool QuantizeAppendKV::is_equivalent(const Primitive& other) const {
+  const QuantizeAppendKV& p_other =
+      static_cast<const QuantizeAppendKV&>(other);
+  return (
+      p_other.seq_offset_ == seq_offset_ && p_other.steps_ == steps_ &&
+      p_other.key_group_size_ == key_group_size_ &&
+      p_other.key_bits_ == key_bits_ &&
+      p_other.value_group_size_ == value_group_size_ &&
+      p_other.value_bits_ == value_bits_);
+}
+
+std::vector<Shape> QuantizeAppendKV::output_shapes(
+    const std::vector<array>& inputs) {
+  // The six updated planes keep the shapes of the six input planes
+  // (inputs[2..7]); inputs[0]/inputs[1] are the incoming k_new/v_new rows.
+  return {
+      inputs[2].shape(),
+      inputs[3].shape(),
+      inputs[4].shape(),
+      inputs[5].shape(),
+      inputs[6].shape(),
+      inputs[7].shape()};
 }
 
 bool ConvertFP8::is_equivalent(const Primitive& other) const {

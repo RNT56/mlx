@@ -1850,6 +1850,130 @@ void fast::Quantize::eval_gpu(
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 
+namespace {
+// TQ_KERNEL_TRACE=1: env-gated one-line-per-eval engagement trace for the fused
+// quantize-append kernel. Mirrors the TQSliceUpdateProbe observability style;
+// zero behavior change when unset.
+struct TQQAppendTrace {
+  bool enabled;
+  TQQAppendTrace() {
+    const char* env = std::getenv("TQ_KERNEL_TRACE");
+    enabled = env != nullptr && env[0] != '\0' && env[0] != '0';
+  }
+};
+TQQAppendTrace& tq_qappend_trace() {
+  static TQQAppendTrace probe;
+  return probe;
+}
+} // namespace
+
+void fast::QuantizeAppendKV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& compute_encoder = metal::get_command_encoder(s);
+
+  // Incoming compact rows [B, n_kv_heads, steps, head_dim].
+  auto k_new = ensure_row_contiguous(inputs[0], d, s);
+  auto v_new = ensure_row_contiguous(inputs[1], d, s);
+
+  // Donate the six full cache planes in place when possible; otherwise fall
+  // back to a full-plane copy (should not normally trigger on the append path).
+  auto prepare_output = [&](int in_idx, int out_idx) {
+    auto& in = inputs[in_idx];
+    auto& out = outputs[out_idx];
+    if (in.is_donatable() && in.flags().row_contiguous) {
+      out.copy_shared_buffer(in);
+    } else {
+      out.set_data(allocator::malloc(out.nbytes()));
+      auto ctype =
+          in.flags().row_contiguous ? CopyType::Vector : CopyType::General;
+      copy_gpu(in, out, ctype, s);
+    }
+  };
+  // outputs: [k_codes, k_scales, k_biases, v_codes, v_scales, v_biases]
+  // inputs:  [k_new, v_new, k_codes, k_scales, k_biases, v_codes, v_scales,
+  //           v_biases]
+  for (int i = 0; i < 6; ++i) {
+    prepare_output(2 + i, i);
+  }
+
+  auto type_string = get_type_string(inputs[0].dtype());
+
+  // One dispatch per (input rows, [codes, scales, biases]) geometry.
+  auto dispatch = [&](const array& w,
+                      array& codes,
+                      array& scales,
+                      array& biases,
+                      int group_size,
+                      int bits) {
+    std::string kname;
+    concatenate(
+        kname,
+        "affine_quantize_append_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits);
+    auto kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "quantize_append",
+        "affine",
+        type_string,
+        group_size,
+        bits);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_output_array(codes, 1);
+    compute_encoder.set_output_array(scales, 2);
+    compute_encoder.set_output_array(biases, 3);
+
+    uint32_t seq_offset = static_cast<uint32_t>(seq_offset_);
+    uint32_t n_steps = static_cast<uint32_t>(steps_);
+    uint32_t capacity_seq = static_cast<uint32_t>(codes.shape(-2));
+    uint32_t elems_per_row = static_cast<uint32_t>(w.shape(-1));
+    compute_encoder.set_bytes(seq_offset, 4);
+    compute_encoder.set_bytes(n_steps, 5);
+    compute_encoder.set_bytes(capacity_seq, 6);
+    compute_encoder.set_bytes(elems_per_row, 7);
+
+    constexpr int simd_size = 32;
+    int per_thread = std::max(group_size / simd_size, 1);
+    size_t nthreads = w.size() / per_thread;
+
+    NS::UInteger thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
+    if (thread_group_size > nthreads) {
+      thread_group_size = nthreads;
+    }
+    auto group_dims = MTL::Size(thread_group_size, 1, 1);
+    bool use_2d = nthreads > UINT_MAX;
+    auto grid_shape = w.shape();
+    grid_shape.back() /= per_thread;
+    MTL::Size grid_dims = use_2d ? get_2d_grid_dims(grid_shape, w.strides())
+                                 : MTL::Size(nthreads, 1, 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+  };
+
+  // K geometry then V geometry.
+  dispatch(
+      k_new, outputs[0], outputs[1], outputs[2], key_group_size_, key_bits_);
+  dispatch(
+      v_new, outputs[3], outputs[4], outputs[5], value_group_size_,
+      value_bits_);
+
+  if (tq_qappend_trace().enabled) {
+    fprintf(
+        stderr,
+        "[tq-qappend] dispatched offset=%d steps=%d\n",
+        seq_offset_,
+        steps_);
+  }
+}
+
 void fast::ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
