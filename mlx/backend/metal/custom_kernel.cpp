@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/jit/includes.h"
@@ -169,6 +171,24 @@ void CustomKernel::eval_gpu(
     return source;
   });
   auto kernel = d.get_kernel(name_, lib);
+
+  // TQ_PIPE_PROBE_V1: env-gated occupancy/pipeline-property probe (roadmap G5).
+  // Zero behavior change unless TQ_PIPELINE_PROBE=1. Prints once per distinct
+  // compiled kernel name (function-constant specialization is baked into name_).
+  if (const char* v = std::getenv("TQ_PIPELINE_PROBE"); v && std::string_view(v) == "1") {
+    static std::mutex tq_pipe_probe_mu;
+    static std::unordered_set<std::string> tq_pipe_probe_seen;
+    std::lock_guard<std::mutex> lock(tq_pipe_probe_mu);
+    if (tq_pipe_probe_seen.insert(name_).second) {
+      std::fprintf(stderr,
+        "TQ_PIPE_PROBE_V1 name=%s static_tgmem=%llu max_threads_per_tg=%llu exec_width=%llu\n",
+        name_.c_str(),
+        (unsigned long long)kernel->staticThreadgroupMemoryLength(),
+        (unsigned long long)kernel->maxTotalThreadsPerThreadgroup(),
+        (unsigned long long)kernel->threadExecutionWidth());
+    }
+  }
+
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
   int index = 0;

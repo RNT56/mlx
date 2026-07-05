@@ -2766,7 +2766,7 @@ const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
       std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   static CustomKernelFunction gqa_kernel = metal_kernel(
-      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native_rtu1_s2",
+      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native_rtu1_s2_rf1",
       {"q",
        "k_packed",
        "k_signs",
@@ -2784,7 +2784,7 @@ const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
        "runtime_attention_scale",
        "runtime_block_count"},
       {"partial_stats", "partial_out"},
-      std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_source),
+      std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_rf1_source),
       std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   return grouped_query ? gqa_kernel : generic_kernel;
@@ -2813,6 +2813,41 @@ const CustomKernelFunction& tq_gqa_block_partials_kernel_v7() {
       std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_v7_source),
       std::string(turbo_quant_detail::turbo_quant_attention_header) +
           std::string(turbo_quant_detail::turbo_quant_attention_header_v7_ext),
+      false);
+  return kernel;
+}
+
+// T2.2 H16 tgmem diet: same source (and back-half algorithm) as the strided/coop
+// v6-family GQA block-partials kernels, but partial/tile_scores are staged as half
+// and tile_has_weight is a 32-lane bitset, halving static threadgroup memory (see
+// mlx-swift Source/MLX/TurboQuant.swift fusedAttentionGQABlockPartialsH16Source /
+// roadmap T2.2). Added here for source-copy symmetry with the Swift registration;
+// native dispatch wiring (selecting this kernel from the native SDPA call path) is
+// NOT implemented in this campaign -- the online-fused decode path used by real
+// models routes through the Swift MLXFast.metalKernel registrations, not this C++
+// entry point. A future native-route campaign can wire selection here.
+const CustomKernelFunction& tq_gqa_block_partials_kernel_h16() {
+  static CustomKernelFunction kernel = metal_kernel(
+      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native_rtu1_s2_h16_rf1",
+      {"q",
+       "k_packed",
+       "k_signs",
+       "k_high_mask",
+       "k_residual_signs",
+       "k_scales",
+       "v_packed",
+       "v_signs",
+       "v_high_mask",
+       "v_residual_signs",
+       "v_scales",
+       "runtime_logical_length",
+       "runtime_ring_offset",
+       "runtime_pinned_prefix_length",
+       "runtime_attention_scale",
+       "runtime_block_count"},
+      {"partial_stats", "partial_out"},
+      std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_h16_rf1_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   return kernel;
 }
@@ -2943,10 +2978,26 @@ bool tq_cooperative_gqa_path_allowed(
     const array& queries,
     const TurboQuantAttentionLayoutDescriptor& layout,
     const TurboQuantPrecisionPolicyDescriptor& precision) {
+  // TQ_COOP=0 is a fail-closed kill switch for the C++ coop route. Default
+  // (unset or any value != "0") preserves the current env-free behavior.
+  if (const char* v = std::getenv("TQ_COOP"); v && std::string_view(v) == "0") {
+    return false;
+  }
   int repeats = queries.shape(1) / layout.kv_head_count;
   // Coop is excluded from layout v7 (its offsets are hardcoded to the v6 token-major
   // packed/bitset/scale layout): gated to exactly v6, not "v6 or newer".
-  if (repeats != 4 || layout.head_dimension != 256 || precision.group_size <= 0 ||
+  bool hd_ok = (layout.head_dimension == 128 || layout.head_dimension == 256);
+  // COOPW (T2.4 stage-2): widened in lockstep with the Swift-side
+  // turboQuantCooperativeQuadDecodeActive guard now that the shared coop kernel source
+  // clamps its r-loops to repeat_count instead of hardcoding r<4u (repeats 2/3/4 all
+  // correct from one source). UNTESTED by this campaign: this native C++ route is not
+  // exercised by the Swift-route online-fused decode path this campaign validates; the
+  // native gqa_kernel selector in fast.cpp still dispatches the same
+  // turbo_quant_gqa_block_partials_rf1_source for every admitted repeat count, so no separate
+  // native _coopw kernel/name was added here -- flag for a future native-route campaign
+  // to verify whether MLX's native kernel cache keys on template params the way the Swift
+  // MLXFast.metalKernel path does before relying on this.
+  if (repeats < 2 || repeats > 4 || !hd_ok || precision.group_size <= 0 ||
       layout.logical_length < 32768 || layout.layout_version != 6) {
     return false;
   }
