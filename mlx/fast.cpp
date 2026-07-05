@@ -2058,7 +2058,7 @@ std::vector<std::pair<std::string, TemplateArg>> tq_attention_value_template(
 
 const CustomKernelFunction& tq_fused_attention_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_fused_decode_runtime_layout_native",
+      "turboquant_attention_fused_decode_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2083,7 +2083,7 @@ const CustomKernelFunction& tq_fused_attention_kernel() {
 
 const CustomKernelFunction& tq_sparse_fused_attention_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_fused_decode_runtime_layout_native",
+      "turboquant_attention_sparse_fused_decode_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2113,7 +2113,7 @@ const CustomKernelFunction& tq_sparse_fused_attention_kernel() {
 
 const CustomKernelFunction& tq_sparse_page_topk_attention_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_page_topk_runtime_layout_native",
+      "turboquant_attention_sparse_page_topk_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2244,7 +2244,7 @@ std::string tq_sparse_page_summary_fused_page_topk_attention_source() {
 
 const CustomKernelFunction& tq_sparse_page_summary_fused_page_topk_attention_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_page_summary_fused_page_topk_runtime_layout_native",
+      "turboquant_attention_sparse_page_summary_fused_page_topk_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2275,7 +2275,7 @@ const CustomKernelFunction& tq_sparse_page_summary_fused_page_topk_attention_ker
 
 const CustomKernelFunction& tq_candidate_sparse_attention_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_candidate_sparse_runtime_layout_native",
+      "turboquant_attention_candidate_sparse_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2308,7 +2308,7 @@ const CustomKernelFunction& tq_candidate_sparse_attention_kernel() {
 
 const CustomKernelFunction& tq_candidate_sparse_gqa_attention_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_candidate_sparse_gqa_runtime_layout_native",
+      "turboquant_attention_candidate_sparse_gqa_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2341,7 +2341,7 @@ const CustomKernelFunction& tq_candidate_sparse_gqa_attention_kernel() {
 
 const CustomKernelFunction& tq_sparse_page_scores_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_page_scores_runtime_layout_native",
+      "turboquant_attention_sparse_page_scores_runtime_layout_native_s2",
       {"q",
        "k_scales",
        "runtime_logical_length",
@@ -2356,7 +2356,7 @@ const CustomKernelFunction& tq_sparse_page_scores_kernel() {
 
 const CustomKernelFunction& tq_sparse_page_summary_scores_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_page_summary_scores_runtime_layout_native",
+      "turboquant_attention_sparse_page_summary_scores_runtime_layout_native_s2",
       {"q",
        "page_summary",
        "runtime_logical_length"},
@@ -2369,7 +2369,7 @@ const CustomKernelFunction& tq_sparse_page_summary_scores_kernel() {
 
 const CustomKernelFunction& tq_sparse_block_stats_kernel(bool grouped_query) {
   static CustomKernelFunction generic_kernel = metal_kernel(
-      "turboquant_attention_sparse_block_stats_runtime_layout_native",
+      "turboquant_attention_sparse_block_stats_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2390,7 +2390,7 @@ const CustomKernelFunction& tq_sparse_block_stats_kernel(bool grouped_query) {
       std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   static CustomKernelFunction gqa_kernel = metal_kernel(
-      "turboquant_attention_sparse_gqa_block_stats_runtime_layout_native",
+      "turboquant_attention_sparse_gqa_block_stats_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2415,7 +2415,7 @@ const CustomKernelFunction& tq_sparse_block_stats_kernel(bool grouped_query) {
 
 const CustomKernelFunction& tq_sparse_gqa_block_stats_topk_candidates_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_gqa_block_stats_topk_candidates_runtime_layout_native",
+      "turboquant_attention_sparse_gqa_block_stats_topk_candidates_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2509,7 +2509,7 @@ const CustomKernelFunction& tq_sparse_topk_compact_selection_kernel() {
 
 const CustomKernelFunction& tq_sparse_topk_global_compact_output_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_topk_global_compact_output_runtime_layout_native",
+      "turboquant_attention_sparse_topk_global_compact_output_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2542,7 +2542,7 @@ const CustomKernelFunction& tq_sparse_topk_global_compact_output_kernel() {
 
 const CustomKernelFunction& tq_sparse_topk_candidate_compact_output_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_topk_candidate_compact_output_runtime_layout_native",
+      "turboquant_attention_sparse_topk_candidate_compact_output_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2576,7 +2576,7 @@ const CustomKernelFunction& tq_sparse_topk_candidate_compact_output_kernel() {
 
 const CustomKernelFunction& tq_sparse_topk_compact_output_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_sparse_topk_compact_output_runtime_layout_native",
+      "turboquant_attention_sparse_topk_compact_output_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2610,7 +2610,7 @@ const CustomKernelFunction& tq_sparse_topk_compact_output_kernel() {
 
 const CustomKernelFunction& tq_sparse_block_partials_kernel(bool grouped_query) {
   static CustomKernelFunction generic_kernel = metal_kernel(
-      "turboquant_attention_sparse_block_partials_runtime_layout_native",
+      "turboquant_attention_sparse_block_partials_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2638,7 +2638,7 @@ const CustomKernelFunction& tq_sparse_block_partials_kernel(bool grouped_query) 
       std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   static CustomKernelFunction gqa_kernel = metal_kernel(
-      "turboquant_attention_sparse_gqa_block_partials_runtime_layout_native",
+      "turboquant_attention_sparse_gqa_block_partials_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2671,7 +2671,7 @@ const CustomKernelFunction& tq_sparse_block_partials_kernel(bool grouped_query) 
 const CustomKernelFunction& tq_sparse_block_selected_partials_kernel(
     bool grouped_query) {
   static CustomKernelFunction generic_kernel = metal_kernel(
-      "turboquant_attention_sparse_block_selected_partials_runtime_layout_native",
+      "turboquant_attention_sparse_block_selected_partials_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2700,7 +2700,7 @@ const CustomKernelFunction& tq_sparse_block_selected_partials_kernel(
       std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   static CustomKernelFunction gqa_kernel = metal_kernel(
-      "turboquant_attention_sparse_gqa_block_selected_partials_runtime_layout_native",
+      "turboquant_attention_sparse_gqa_block_selected_partials_runtime_layout_native_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2744,7 +2744,7 @@ const CustomKernelFunction& tq_sparse_block_sum_reduce_kernel() {
 
 const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
   static CustomKernelFunction generic_kernel = metal_kernel(
-      "turboquant_attention_fused_block_partials_runtime_layout_native",
+      "turboquant_attention_fused_block_partials_runtime_layout_native_rtu1_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2759,13 +2759,14 @@ const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
        "runtime_logical_length",
        "runtime_ring_offset",
        "runtime_pinned_prefix_length",
-       "runtime_attention_scale"},
+       "runtime_attention_scale",
+       "runtime_block_count"},
       {"partial_stats", "partial_out"},
       std::string(turbo_quant_detail::turbo_quant_block_partials_source),
       std::string(turbo_quant_detail::turbo_quant_attention_header),
       false);
   static CustomKernelFunction gqa_kernel = metal_kernel(
-      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native",
+      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native_rtu1_s2",
       {"q",
        "k_packed",
        "k_signs",
@@ -2780,7 +2781,8 @@ const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
        "runtime_logical_length",
        "runtime_ring_offset",
        "runtime_pinned_prefix_length",
-       "runtime_attention_scale"},
+       "runtime_attention_scale",
+       "runtime_block_count"},
       {"partial_stats", "partial_out"},
       std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_source),
       std::string(turbo_quant_detail::turbo_quant_attention_header),
@@ -2788,10 +2790,37 @@ const CustomKernelFunction& tq_block_partials_kernel(bool grouped_query) {
   return grouped_query ? gqa_kernel : generic_kernel;
 }
 
+const CustomKernelFunction& tq_gqa_block_partials_kernel_v7() {
+  static CustomKernelFunction kernel = metal_kernel(
+      "turboquant_attention_fused_gqa_block_partials_runtime_layout_native_rtu1_s2_v7",
+      {"q",
+       "k_packed",
+       "k_signs",
+       "k_high_mask",
+       "k_residual_signs",
+       "k_scales",
+       "v_packed",
+       "v_signs",
+       "v_high_mask",
+       "v_residual_signs",
+       "v_scales",
+       "runtime_logical_length",
+       "runtime_ring_offset",
+       "runtime_pinned_prefix_length",
+       "runtime_attention_scale",
+       "runtime_block_count"},
+      {"partial_stats", "partial_out"},
+      std::string(turbo_quant_detail::turbo_quant_gqa_block_partials_v7_source),
+      std::string(turbo_quant_detail::turbo_quant_attention_header) +
+          std::string(turbo_quant_detail::turbo_quant_attention_header_v7_ext),
+      false);
+  return kernel;
+}
+
 const CustomKernelFunction& tq_block_reduce_kernel() {
   static CustomKernelFunction kernel = metal_kernel(
-      "turboquant_attention_fused_block_reduce_native",
-      {"partial_stats", "partial_out"},
+      "turboquant_attention_fused_block_reduce_native_rtu1_s2",
+      {"partial_stats", "partial_out", "runtime_block_count"},
       {"out"},
       std::string(turbo_quant_detail::turbo_quant_block_reduce_source),
       std::string(turbo_quant_detail::turbo_quant_attention_header),
@@ -2915,8 +2944,10 @@ bool tq_cooperative_gqa_path_allowed(
     const TurboQuantAttentionLayoutDescriptor& layout,
     const TurboQuantPrecisionPolicyDescriptor& precision) {
   int repeats = queries.shape(1) / layout.kv_head_count;
+  // Coop is excluded from layout v7 (its offsets are hardcoded to the v6 token-major
+  // packed/bitset/scale layout): gated to exactly v6, not "v6 or newer".
   if (repeats != 4 || layout.head_dimension != 256 || precision.group_size <= 0 ||
-      layout.logical_length < 32768 || layout.layout_version < 6) {
+      layout.logical_length < 32768 || layout.layout_version != 6) {
     return false;
   }
   bool uniform = precision.key_base_bits == precision.key_high_bits;
@@ -3693,9 +3724,15 @@ std::vector<array> tq_dispatch_native_jit(
   }
   if (block_width > 0) {
     int active_blocks = (layout.logical_length + block_width - 1) / block_width;
+    bool tile_transposed_v7 = layout.layout_version == 7;
     bool grouped_query = repeats > 1 && repeats <= 4;
-    bool coop = grouped_query &&
+    bool coop = !tile_transposed_v7 && grouped_query &&
         tq_cooperative_gqa_path_allowed(queries, layout, precision);
+    if (tile_transposed_v7 && !grouped_query) {
+      throw std::invalid_argument(
+          "[turbo_quant_segmented_attention] layout v7 requires the "
+          "grouped-query block-partials kernel (query head repeats 2...4).");
+    }
     int partial_rows = grouped_query
         ? queries.shape(0) * layout.kv_head_count * queries.shape(2)
         : row_count;
@@ -3703,13 +3740,18 @@ std::vector<array> tq_dispatch_native_jit(
         tq_attention_value_template(queries, layout, precision, options, output_dtype);
     partial_template.push_back({"THREADS_PER_BLOCK", block_width});
     partial_template.push_back({"BLOCK_TOKENS", block_width});
-    partial_template.push_back({"BLOCK_COUNT", active_blocks});
     partial_template.push_back({"GQA_REPEATS", grouped_query ? repeats : 1});
-    partial_template.push_back({"LANES_PER_TOKEN", coop ? 4 : 1});
+    if (!tile_transposed_v7) {
+      partial_template.push_back({"LANES_PER_TOKEN", coop ? 4 : 1});
+    }
 
     Dtype partial_dtype = output_dtype == float32 ? float32 : output_dtype;
-    auto partials = tq_block_partials_kernel(grouped_query)(
-        inputs,
+    auto partial_inputs = inputs;
+    partial_inputs.push_back(array(active_blocks, int32));
+    auto partials = (tile_transposed_v7
+                          ? tq_gqa_block_partials_kernel_v7()
+                          : tq_block_partials_kernel(grouped_query))(
+        partial_inputs,
         {Shape{row_count, active_blocks, 2},
          Shape{row_count, active_blocks, layout.head_dimension}},
         {float32, partial_dtype},
@@ -3722,22 +3764,24 @@ std::vector<array> tq_dispatch_native_jit(
 
     int reduce_width = tq_next_power_of_two_clamped(
         std::max(active_blocks, layout.head_dimension), 512);
+    std::vector<array> reduce_inputs = partials;
+    reduce_inputs.push_back(array(active_blocks, int32));
     auto output = tq_block_reduce_kernel()(
-        partials,
+        reduce_inputs,
         {output_shape},
         {output_dtype},
         {row_count * reduce_width, 1, 1},
         {reduce_width, 1, 1},
         {{"ROW_COUNT", row_count},
          {"HEAD_DIM", layout.head_dimension},
-         {"BLOCK_COUNT", active_blocks},
          {"THREADS_PER_BLOCK", reduce_width},
          {"OUTPUT_DTYPE", output_dtype}},
         std::nullopt,
         false,
         stream)[0];
 
-    int kernel_kind = coop ? 4 : (grouped_query ? 3 : 2);
+    int kernel_kind =
+        tile_transposed_v7 ? 12 : (coop ? 4 : (grouped_query ? 3 : 2));
     flags |= 2 | (grouped_query ? 4 : 0) | (coop ? 8 : 0);
     if (output_diagnostics) {
       return {output,
@@ -3752,6 +3796,12 @@ std::vector<array> tq_dispatch_native_jit(
                   flags)};
     }
     return {output};
+  }
+
+  if (layout.layout_version == 7) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] layout v7 is only ported to the "
+        "block-partials path; the fused single-pass kernel is not ported.");
   }
 
   int threadgroup_width =
@@ -3809,10 +3859,16 @@ void validate_tq_descriptors(
   }
 
   if (layout.layout_version != 4 && layout.layout_version != 5 &&
-      layout.layout_version != 6) {
+      layout.layout_version != 6 && layout.layout_version != 7) {
     std::ostringstream msg;
     msg << "[" << tq_sdpa_tag << "] unsupported layout version "
         << layout.layout_version << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (layout.layout_version == 7 && layout.capacity % 32 != 0) {
+    std::ostringstream msg;
+    msg << "[" << tq_sdpa_tag << "] layout v7 requires capacity to be a "
+        << "multiple of 32; received " << layout.capacity << ".";
     throw std::invalid_argument(msg.str());
   }
   if (layout.batch_size <= 0 || layout.kv_head_count <= 0 ||
@@ -3910,6 +3966,12 @@ void validate_tq_descriptors(
         "0 (off), 1 (threshold), 2 (top-k), 3 (cumulative mass), or 4 "
         "(hybrid cumulative mass plus max top-k), 5 (block threshold), or "
         "6 (page top-k), or 7 (candidate sparse).");
+  }
+  if (layout.layout_version == 7 &&
+      (sparse_selection_mode != 0 || options.sparse_v_threshold > 0)) {
+    throw std::invalid_argument(
+        "[turbo_quant_segmented_attention] sparse paths are not ported to "
+        "layout v7.");
   }
   if (options.sparse_v_top_k < 0 || options.sparse_v_max_top_k < 0 ||
       options.sparse_v_recent_tokens < 0 ||

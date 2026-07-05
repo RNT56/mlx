@@ -1,11 +1,57 @@
 // Copyright © 2024 Apple Inc.
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string_view>
+#include <unordered_map>
+
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core::fast {
+
+namespace {
+// TQ_HOST_PROBE_V1: env-gated host-overhead probe (roadmap G2).
+// Zero behavior change unless TQ_HOST_PROBE=1 is set in the environment.
+struct TQHostProbeCustomKernelStats {
+  std::atomic<uint64_t> evals{0};
+  std::atomic<uint64_t> compare_ns{0};
+  std::atomic<uint64_t> cache_invalidations{0};
+  std::atomic<uint64_t> library_builds{0};
+  std::atomic<uint64_t> library_build_ns{0};
+};
+inline TQHostProbeCustomKernelStats& tq_host_probe_custom_kernel_stats() {
+  static TQHostProbeCustomKernelStats stats;
+  return stats;
+}
+inline void tq_host_probe_custom_kernel_emit() {
+  auto& s = tq_host_probe_custom_kernel_stats();
+  std::fprintf(
+      stderr,
+      "TQ_HOST_PROBE_V1 custom_kernel evals=%llu compare_ns=%llu cache_invalidations=%llu library_builds=%llu library_build_ns=%llu\n",
+      static_cast<unsigned long long>(s.evals.load()),
+      static_cast<unsigned long long>(s.compare_ns.load()),
+      static_cast<unsigned long long>(s.cache_invalidations.load()),
+      static_cast<unsigned long long>(s.library_builds.load()),
+      static_cast<unsigned long long>(s.library_build_ns.load()));
+}
+inline bool tq_host_probe_custom_kernel_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TQ_HOST_PROBE");
+    bool on = value != nullptr && std::string_view(value) == "1";
+    if (on) {
+      std::atexit(tq_host_probe_custom_kernel_emit);
+    }
+    return on;
+  }();
+  return enabled;
+}
+} // namespace
 
 struct CustomKernelCache {
   std::unordered_map<std::string, std::string> libraries;
@@ -16,12 +62,28 @@ static CustomKernelCache& cache() {
   return cache_;
 };
 
+// TQ_T11: the CustomKernelCache above is find/emplace/assigned from eval_gpu
+// concurrently across streams; guard it explicitly instead of relying on
+// unsynchronized access.
+static std::mutex& cache_mutex() {
+  static std::mutex m;
+  return m;
+}
+
 void CustomKernel::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   // silence some warnings
   (void)is_precompiled_;
   (void)shared_memory_;
+
+  const bool tq_probe = tq_host_probe_custom_kernel_enabled();
+  if (tq_probe) {
+    auto n = tq_host_probe_custom_kernel_stats().evals.fetch_add(1) + 1;
+    if (n % 1000 == 0) {
+      tq_host_probe_custom_kernel_emit();
+    }
+  }
 
   auto& s = stream();
 
@@ -54,6 +116,11 @@ void CustomKernel::eval_gpu(
   auto& d = metal::device(s.device);
 
   {
+    std::chrono::steady_clock::time_point tq_compare_start;
+    if (tq_probe) {
+      tq_compare_start = std::chrono::steady_clock::now();
+    }
+    std::lock_guard<std::mutex> lock(cache_mutex());
     // Clear kernels from the device library cache if needed
     auto& kernel_cache = cache();
     if (auto it = kernel_cache.libraries.find(name_);
@@ -62,13 +129,45 @@ void CustomKernel::eval_gpu(
         auto& d = metal::device(s.device);
         d.clear_library(name_);
         it->second = source_;
+        if (tq_probe) {
+          tq_host_probe_custom_kernel_stats().cache_invalidations.fetch_add(
+              1, std::memory_order_relaxed);
+        }
       }
     } else {
       kernel_cache.libraries.emplace(name_, source_);
     }
+    if (tq_probe) {
+      auto tq_compare_elapsed =
+          std::chrono::steady_clock::now() - tq_compare_start;
+      tq_host_probe_custom_kernel_stats().compare_ns.fetch_add(
+          static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  tq_compare_elapsed)
+                  .count()),
+          std::memory_order_relaxed);
+    }
   }
 
-  auto lib = d.get_library(name_, [this] { return metal::utils() + source_; });
+  auto lib = d.get_library(name_, [this, tq_probe] {
+    std::chrono::steady_clock::time_point tq_build_start;
+    if (tq_probe) {
+      tq_build_start = std::chrono::steady_clock::now();
+      tq_host_probe_custom_kernel_stats().library_builds.fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    auto source = metal::utils() + source_;
+    if (tq_probe) {
+      auto tq_build_elapsed =
+          std::chrono::steady_clock::now() - tq_build_start;
+      tq_host_probe_custom_kernel_stats().library_build_ns.fetch_add(
+          static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  tq_build_elapsed).count()),
+          std::memory_order_relaxed);
+    }
+    return source;
+  });
   auto kernel = d.get_kernel(name_, lib);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);

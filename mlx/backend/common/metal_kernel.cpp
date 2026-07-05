@@ -4,6 +4,14 @@
 #include <regex>
 #include <sstream>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string_view>
+#include <unordered_map>
+
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/fast.h"
@@ -17,6 +25,60 @@ namespace {
 
 // Inputs with fewer elements are passed in the constant address space
 constexpr int max_constant_array_size = 8;
+
+// TQ_HOST_PROBE_V1: env-gated host-overhead probe (roadmap G2).
+// Zero behavior change unless TQ_HOST_PROBE=1 is set in the environment.
+struct TQHostProbeMetalKernelStats {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> regex_ns{0};
+  std::atomic<uint64_t> signature_ns{0};
+  std::atomic<uint64_t> total_ns{0};
+  std::atomic<uint64_t> memo_hits{0};
+};
+inline TQHostProbeMetalKernelStats& tq_host_probe_metal_kernel_stats() {
+  static TQHostProbeMetalKernelStats stats;
+  return stats;
+}
+inline void tq_host_probe_metal_kernel_emit() {
+  auto& s = tq_host_probe_metal_kernel_stats();
+  std::fprintf(
+      stderr,
+      "TQ_HOST_PROBE_V1 metal_kernel calls=%llu regex_ns=%llu signature_ns=%llu total_ns=%llu memo_hits=%llu\n",
+      static_cast<unsigned long long>(s.calls.load()),
+      static_cast<unsigned long long>(s.regex_ns.load()),
+      static_cast<unsigned long long>(s.signature_ns.load()),
+      static_cast<unsigned long long>(s.total_ns.load()),
+      static_cast<unsigned long long>(s.memo_hits.load()));
+}
+inline bool tq_host_probe_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TQ_HOST_PROBE");
+    bool on = value != nullptr && std::string_view(value) == "1";
+    if (on) {
+      std::atexit(tq_host_probe_metal_kernel_emit);
+    }
+    return on;
+  }();
+  return enabled;
+}
+
+// TQ_T11: memoized kernel-name/source generation. The fully-suffixed kernel
+// name is a 1:1 identity for the generated source (see the comment above the
+// dtype suffix loop), so the raw template string + dtype/s/c suffix is a
+// collision-safe key that avoids the per-call regex and source rebuild.
+struct TQKernelSourceCacheEntry {
+  std::string kernel_name;
+  std::string kernel_source;
+};
+inline std::mutex& tq_kernel_source_cache_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+inline std::unordered_map<std::string, TQKernelSourceCacheEntry>&
+tq_kernel_source_cache() {
+  static std::unordered_map<std::string, TQKernelSourceCacheEntry> cache;
+  return cache;
+}
 
 Stream resolve_metal_kernel_stream(StreamOrDevice s) {
   if (metal::is_available()) {
@@ -290,64 +352,167 @@ CustomKernelFunction metal_kernel(
 
     auto s = resolve_metal_kernel_stream(s_);
 
-    std::string kernel_name = "custom_kernel_" + name;
-    std::string template_def = "";
-    if (!template_args.empty()) {
-      std::regex disallowed_chars("\\<|\\>|(, )");
-      template_def = write_template(template_args);
-      auto template_hash =
-          std::regex_replace(template_def, disallowed_chars, "_");
-      template_hash.pop_back();
-      kernel_name += "_";
-      kernel_name += template_hash;
+    const bool tq_probe = tq_host_probe_enabled();
+    std::chrono::steady_clock::time_point tq_total_start;
+    if (tq_probe) {
+      tq_total_start = std::chrono::steady_clock::now();
     }
 
-    // The generated source depends on the dtypes of the inputs and outputs
-    // and on how each input is passed (see `write_signature`). Include them
-    // in the kernel name so that a given name always maps to the same source.
+    std::string template_def =
+        template_args.empty() ? std::string() : write_template(template_args);
+    std::string memo_key;
+    memo_key.reserve(name.size() + template_def.size() + 8 * inputs.size() + 16);
+    memo_key += name;
+    memo_key += '\x1f';
+    memo_key += template_def;
     for (const auto& arr : inputs) {
-      kernel_name += "_";
-      kernel_name += get_type_string(arr.dtype());
+      memo_key += "_";
+      memo_key += get_type_string(arr.dtype());
       if (arr.ndim() == 0) {
-        kernel_name += "s";
+        memo_key += "s";
       } else if (arr.size() < max_constant_array_size) {
-        kernel_name += "c";
+        memo_key += "c";
       }
     }
     for (const auto& dtype : output_dtypes) {
-      kernel_name += "_";
-      kernel_name += get_type_string(dtype);
+      memo_key += "_";
+      memo_key += get_type_string(dtype);
     }
 
-    std::string kernel_source = write_signature(
-        kernel_name,
-        header,
-        source,
-        input_names,
-        inputs,
-        output_names,
-        output_dtypes,
-        template_args,
-        attributes,
-        shape_infos,
-        atomic_outputs);
-
-    if (!template_args.empty()) {
-      template_def = kernel_name + template_def;
-      kernel_source += "\ntemplate [[host_name(\"";
-      kernel_source += kernel_name;
-      kernel_source += "\")]] [[kernel]] decltype(";
-      kernel_source += template_def;
-      kernel_source += ") ";
-      kernel_source += template_def;
-      kernel_source += ";\n";
+    std::string kernel_name;
+    std::string kernel_source;
+    bool memo_hit = false;
+    {
+      std::lock_guard<std::mutex> lock(tq_kernel_source_cache_mutex());
+      auto it = tq_kernel_source_cache().find(memo_key);
+      if (it != tq_kernel_source_cache().end()) {
+        kernel_name = it->second.kernel_name;
+        kernel_source = it->second.kernel_source;
+        memo_hit = true;
+      }
     }
 
-    if (verbose) {
-      std::cout << "Generated source code for `" << name << "`:" << std::endl
-                << "```" << std::endl
-                << kernel_source << std::endl
-                << "```" << std::endl;
+    if (memo_hit) {
+      if (tq_probe) {
+        tq_host_probe_metal_kernel_stats().memo_hits.fetch_add(
+            1, std::memory_order_relaxed);
+      }
+      if (verbose) {
+        std::cout << "Generated source code for `" << name
+                   << "`:" << std::endl
+                   << "```" << std::endl
+                   << kernel_source << std::endl
+                   << "```" << std::endl;
+      }
+    } else {
+      kernel_name = "custom_kernel_" + name;
+      std::chrono::steady_clock::time_point tq_regex_start;
+      if (tq_probe) {
+        tq_regex_start = std::chrono::steady_clock::now();
+      }
+      if (!template_args.empty()) {
+        std::regex disallowed_chars("\\<|\\>|(, )");
+        auto template_hash =
+            std::regex_replace(template_def, disallowed_chars, "_");
+        template_hash.pop_back();
+        kernel_name += "_";
+        kernel_name += template_hash;
+      }
+      if (tq_probe) {
+        auto tq_regex_elapsed =
+            std::chrono::steady_clock::now() - tq_regex_start;
+        tq_host_probe_metal_kernel_stats().regex_ns.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    tq_regex_elapsed)
+                    .count()),
+            std::memory_order_relaxed);
+      }
+
+      // The generated source depends on the dtypes of the inputs and outputs
+      // and on how each input is passed (see `write_signature`). Include
+      // them in the kernel name so that a given name always maps to the
+      // same source.
+      for (const auto& arr : inputs) {
+        kernel_name += "_";
+        kernel_name += get_type_string(arr.dtype());
+        if (arr.ndim() == 0) {
+          kernel_name += "s";
+        } else if (arr.size() < max_constant_array_size) {
+          kernel_name += "c";
+        }
+      }
+      for (const auto& dtype : output_dtypes) {
+        kernel_name += "_";
+        kernel_name += get_type_string(dtype);
+      }
+
+      std::chrono::steady_clock::time_point tq_signature_start;
+      if (tq_probe) {
+        tq_signature_start = std::chrono::steady_clock::now();
+      }
+      kernel_source = write_signature(
+          kernel_name,
+          header,
+          source,
+          input_names,
+          inputs,
+          output_names,
+          output_dtypes,
+          template_args,
+          attributes,
+          shape_infos,
+          atomic_outputs);
+      if (tq_probe) {
+        auto tq_signature_elapsed =
+            std::chrono::steady_clock::now() - tq_signature_start;
+        tq_host_probe_metal_kernel_stats().signature_ns.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    tq_signature_elapsed)
+                    .count()),
+            std::memory_order_relaxed);
+      }
+
+      if (!template_args.empty()) {
+        std::string template_inst = kernel_name + template_def;
+        kernel_source += "\ntemplate [[host_name(\"";
+        kernel_source += kernel_name;
+        kernel_source += "\")]] [[kernel]] decltype(";
+        kernel_source += template_inst;
+        kernel_source += ") ";
+        kernel_source += template_inst;
+        kernel_source += ";\n";
+      }
+
+      if (verbose) {
+        std::cout << "Generated source code for `" << name << "`:" << std::endl
+                  << "```" << std::endl
+                  << kernel_source << std::endl
+                  << "```" << std::endl;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(tq_kernel_source_cache_mutex());
+        tq_kernel_source_cache().emplace(
+            std::move(memo_key),
+            TQKernelSourceCacheEntry{kernel_name, kernel_source});
+      }
+    }
+
+    if (tq_probe) {
+      auto tq_total_elapsed = std::chrono::steady_clock::now() - tq_total_start;
+      auto& stats = tq_host_probe_metal_kernel_stats();
+      stats.total_ns.fetch_add(
+          static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  tq_total_elapsed)
+                  .count()),
+          std::memory_order_relaxed);
+      auto n = stats.calls.fetch_add(1) + 1;
+      if (n % 1000 == 0) {
+        tq_host_probe_metal_kernel_emit();
+      }
     }
 
     return array::make_arrays(
