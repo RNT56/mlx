@@ -3222,8 +3222,24 @@ bool tq_cooperative_gqa_path_allowed(
   // native _coopw kernel/name was added here -- flag for a future native-route campaign
   // to verify whether MLX's native kernel cache keys on template params the way the Swift
   // MLXFast.metalKernel path does before relying on this.
+  // Context floor. Default 32768 (coop pays off once KV traffic dominates the
+  // decode; strided is neutral/better at short context). TQ_COOP_MIN_CONTEXT
+  // is the measurement override, mirroring the Swift-side
+  // turboQuantCooperativeQuadDecodeActive gate: it lets an A/B engage the coop
+  // (LANES_PER_TOKEN=4, kernel kind 4) branch below the production floor at
+  // tractable prefill contexts. Unset => behavior identical to the previous
+  // hardcoded 32768. NOTE: this gate also feeds the sparse block-stats call
+  // site; measurement runs must keep sparse off.
+  int coop_min_context = 32768;
+  if (const char* v = std::getenv("TQ_COOP_MIN_CONTEXT")) {
+    char* end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    if (end != v && *end == '\0' && parsed > 0 && parsed <= (1 << 30)) {
+      coop_min_context = static_cast<int>(parsed);
+    }
+  }
   if (repeats < 2 || repeats > 4 || !hd_ok || precision.group_size <= 0 ||
-      layout.logical_length < 32768 || layout.layout_version != 6) {
+      layout.logical_length < coop_min_context || layout.layout_version != 6) {
     return false;
   }
   bool uniform = precision.key_base_bits == precision.key_high_bits;
