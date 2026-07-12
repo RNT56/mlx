@@ -298,7 +298,8 @@ std::string JitCompiler::exec(const std::string& cmd) {
 #if defined(MLX_JIT_COMPILER_UNAVAILABLE)
   (void)cmd;
   throw std::runtime_error("JIT compiler execution is unavailable on this platform.");
-#elif defined(_MSC_VER)
+#else
+#ifdef _MSC_VER
   FILE* pipe = _popen(cmd.c_str(), "r");
 #else
   FILE* pipe = popen(cmd.c_str(), "r");
@@ -343,6 +344,7 @@ std::string JitCompiler::exec(const std::string& cmd) {
             ret));
   }
   return ret;
+#endif
 }
 
 } // namespace mlx::core
