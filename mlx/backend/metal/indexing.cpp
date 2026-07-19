@@ -1,5 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 
 #include "mlx/backend/common/compiled.h"
@@ -728,6 +731,38 @@ void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 
+namespace {
+// TQ_COPY_PROBE=1: env-gated observability for the cache-append donation
+// hazard (external-intel-synthesis-2026-07-05, H2). SliceUpdate must donate
+// its input or the copy_gpu below materializes the FULL destination — a
+// whole KV plane per token per layer on the cache-append path. Counts and
+// bytes are printed to stderr at process exit; zero behavior change unset.
+struct TQSliceUpdateProbe {
+  std::atomic<uint64_t> donated{0};
+  std::atomic<uint64_t> copied{0};
+  std::atomic<uint64_t> copied_bytes{0};
+  bool enabled;
+  TQSliceUpdateProbe() {
+    const char* env = std::getenv("TQ_COPY_PROBE");
+    enabled = env != nullptr && env[0] == '1';
+  }
+  ~TQSliceUpdateProbe() {
+    if (enabled) {
+      fprintf(
+          stderr,
+          "[tq-copy-probe] slice_update donated=%llu copied=%llu copied_mb=%.1f\n",
+          static_cast<unsigned long long>(donated.load()),
+          static_cast<unsigned long long>(copied.load()),
+          static_cast<double>(copied_bytes.load()) / (1024.0 * 1024.0));
+    }
+  }
+};
+TQSliceUpdateProbe& tq_slice_update_probe() {
+  static TQSliceUpdateProbe probe;
+  return probe;
+}
+} // namespace
+
 void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 2);
   if (out.size() == 0) {
@@ -737,6 +772,15 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   auto& in = inputs[0];
   auto& upd = inputs[1];
+
+  if (auto& probe = tq_slice_update_probe(); probe.enabled) {
+    if (in.is_donatable()) {
+      probe.donated.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      probe.copied.fetch_add(1, std::memory_order_relaxed);
+      probe.copied_bytes.fetch_add(in.nbytes(), std::memory_order_relaxed);
+    }
+  }
 
   if (upd.size() == 0) {
     out.copy_shared_buffer(in);

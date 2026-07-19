@@ -454,6 +454,63 @@ class Quantize : public Custom {
   bool dequantize_;
 };
 
+// Fused quantize-and-append for the affine K8/V4 KV-cache append ladder.
+// Quantizes incoming K/V rows and writes the codes/scales/biases directly into
+// rows [seq_offset, seq_offset + steps) of the six full preallocated cache
+// planes, collapsing the per-token quantize + slice_update ladder into a single
+// graph node with two kernel dispatches. eval_cpu is intentionally NYI so the
+// Custom fallback (the bit-identical op ladder) is used off-GPU.
+class QuantizeAppendKV : public Custom {
+ public:
+  explicit QuantizeAppendKV(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int seq_offset,
+      int steps,
+      int key_group_size,
+      int key_bits,
+      int value_group_size,
+      int value_bits)
+      : Custom(stream, std::move(fallback)),
+        seq_offset_(seq_offset),
+        steps_(steps),
+        key_group_size_(key_group_size),
+        key_bits_(key_bits),
+        value_group_size_(value_group_size),
+        value_bits_(value_bits) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("[QuantizeAppendKV] NYI on CPU.");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(QuantizeAppendKV);
+
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        seq_offset_,
+        steps_,
+        key_group_size_,
+        key_bits_,
+        value_group_size_,
+        value_bits_);
+  }
+
+ private:
+  int seq_offset_;
+  int steps_;
+  int key_group_size_;
+  int key_bits_;
+  int value_group_size_;
+  int value_bits_;
+};
+
 using ScalarArg = std::variant<bool, int, float>;
 
 class CustomKernel : public Primitive {

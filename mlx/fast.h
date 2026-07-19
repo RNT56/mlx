@@ -121,6 +121,37 @@ mixed_quantized_scaled_dot_product_attention_with_diagnostics(
     float sparse_v_threshold = 0.0f,
     StreamOrDevice s = {});
 
+/** Fused quantize-and-append for the affine K8/V4 KV-cache append ladder.
+ *
+ * Quantizes the incoming `k_new`/`v_new` rows (fp16/bf16/fp32,
+ * `[B, n_kv_heads, steps, head_dim]`) with the stock affine quantize math and
+ * writes the resulting codes/scales/biases into rows
+ * `[seq_offset, seq_offset + steps)` of the six full preallocated cache planes,
+ * returning the six updated planes (buffers are donated in place when
+ * donatable). Supported specialization set (else throws
+ * `std::invalid_argument`): `key_bits == 8` with `key_group_size` in {64, 128};
+ * `value_bits == 4` with `value_group_size` in {32, 64, 128}. Power-of-two bits
+ * only. `head_dim` must be divisible by the group size, and
+ * `seq_offset + steps` must be within the plane capacity. Setting the
+ * environment variable `TQ_QAPPEND=0` returns the bit-identical op fallback.
+ **/
+MLX_API std::vector<array> quantize_append_kv(
+    const array& k_new,
+    const array& v_new,
+    const array& k_codes,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_codes,
+    const array& v_scales,
+    const array& v_biases,
+    int seq_offset,
+    int steps,
+    int key_group_size,
+    int key_bits,
+    int value_group_size,
+    int value_bits,
+    StreamOrDevice s = {});
+
 struct TurboQuantAttentionLayoutDescriptor {
   int layout_version;
   int batch_size;

@@ -11,6 +11,13 @@
 
 #include <fmt/format.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE || TARGET_OS_TV || TARGET_OS_WATCH || TARGET_OS_VISION
+#define MLX_JIT_COMPILER_UNAVAILABLE 1
+#endif
+#endif
+
 #if defined(_MSC_VER) && \
     (defined(_M_X64) || defined(_M_IX86) || defined(_M_AMD64))
 #include <intrin.h>
@@ -194,7 +201,9 @@ const std::tuple<bool, std::string, std::string>& JitCompiler::get_preamble() {
 }
 
 bool JitCompiler::available() {
-#ifdef _MSC_VER
+#if defined(MLX_JIT_COMPILER_UNAVAILABLE)
+  return false;
+#elif defined(_MSC_VER)
   static bool result = [] {
     try {
       bool use_include = std::get<0>(get_preamble());
@@ -219,6 +228,12 @@ std::string JitCompiler::build_command(
     const std::filesystem::path& dir,
     const std::string& source_file_name,
     const std::string& shared_lib_name) {
+#if defined(MLX_JIT_COMPILER_UNAVAILABLE)
+  (void)dir;
+  (void)source_file_name;
+  (void)shared_lib_name;
+  return {};
+#else
   auto& [use_include, include_dir, preamble] = get_preamble();
 #ifdef _MSC_VER
   std::string compiler_flags;
@@ -276,9 +291,14 @@ std::string JitCompiler::build_command(
       (dir / source_file_name).string(),
       (dir / shared_lib_name).string());
 #endif
+#endif
 }
 
 std::string JitCompiler::exec(const std::string& cmd) {
+#if defined(MLX_JIT_COMPILER_UNAVAILABLE)
+  (void)cmd;
+  throw std::runtime_error("JIT compiler execution is unavailable on this platform.");
+#else
 #ifdef _MSC_VER
   FILE* pipe = _popen(cmd.c_str(), "r");
 #else
@@ -324,6 +344,7 @@ std::string JitCompiler::exec(const std::string& cmd) {
             ret));
   }
   return ret;
+#endif
 }
 
 } // namespace mlx::core

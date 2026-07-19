@@ -56,10 +56,14 @@ int select_sdpa_blocks(
   // sequence more aggressively for decode-shaped calls so macOS does not abort
   // the work as an interactivity hazard at 128K+ context.
   if (quantized && q_seq_len <= 1 && N >= 32768) {
-    if (N <= 65536) {
-      return apply_sdpa_blocks_override(512);
-    }
-    return apply_sdpa_blocks_override(1024);
+    // 256 beat the previous 512/1024 ladder in all 4 paired interleaved A/B
+    // rounds (n=25 each) at 32K (-7.1%/-18.4%) and 131K (-4.2%/-10.4%)
+    // ms/query-token on applegpu_g14s; evidence:
+    // artifacts/affine-hostside-20260705/blocks-*.json. A 131K scan still
+    // splits into 512-token blocks, preserving the watchdog mitigation.
+    // Not yet re-measured on phone-class devices; the env overrides above
+    // remain the escape hatch and the A/B instrument.
+    return apply_sdpa_blocks_override(256);
   }
 
   if (devc == 's') {

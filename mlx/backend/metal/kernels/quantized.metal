@@ -180,3 +180,19 @@
   instantiate_quantized_groups(8)
 
 instantiate_quantized_all() // clang-format on
+
+// TurboQuant P1-1 fused quantize-append. Restricted to the supported K8/V4
+// specialization set (K8 gs{64,128}, V4 gs{32,64,128}) for the float types the
+// affine quantize path uses. Uses the same instantiate_quantized macro so the
+// dispatched kernel name is affine_quantize_append_<type>_gs_<gs>_b_<bits>.
+// clang-format off
+#define instantiate_quantize_append_type(type)                     \
+  instantiate_quantized(affine_quantize_append, type, 64, 8)       \
+  instantiate_quantized(affine_quantize_append, type, 128, 8)      \
+  instantiate_quantized(affine_quantize_append, type, 32, 4)       \
+  instantiate_quantized(affine_quantize_append, type, 64, 4)       \
+  instantiate_quantized(affine_quantize_append, type, 128, 4)
+
+instantiate_quantize_append_type(float)
+instantiate_quantize_append_type(float16_t)
+instantiate_quantize_append_type(bfloat16_t) // clang-format on

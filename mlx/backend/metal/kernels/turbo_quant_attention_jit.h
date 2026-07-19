@@ -503,7 +503,7 @@ inline constexpr std::string_view turbo_quant_attention_header = R"TQMLX(       
             uint groups_per_vector
         ) {
             return ((((batch * kv_heads + head) * capacity + token)
-                * groups_per_vector + group) * 3u) + scale_index;
+                * groups_per_vector + group) * 2u) + scale_index;
         }
 
         inline uint tq_physical_token(
@@ -1221,6 +1221,456 @@ inline constexpr std::string_view turbo_quant_attention_header = R"TQMLX(       
             float norm = scales[tq_scale_offset(
                 batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)];
             float residual_norm = scales[tq_scale_offset(
+                batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)];
+            float residual_scale = residual_norm * sqrt(3.14159265358979323846f / (2.0f * float(count)));
+            for (uint repeat = 0u; repeat < 4u; repeat++) {
+                scores[repeat] += norm * quantized_dot[repeat] + residual_scale * sign_dot[repeat];
+            }
+        }
+)TQMLX";
+
+inline constexpr std::string_view turbo_quant_attention_header_v7_ext = R"TQMLX(        inline uint tq_packed_offset_v7(
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint word,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint words_per_token = groups_per_vector * mag_words_per_group;
+            uint plane_base = (batch * kv_heads + head) * capacity * words_per_token;
+            uint tile_base = plane_base + (token & ~31u) * words_per_token;
+            return tile_base + ((group * mag_words_per_group + word) << 5) + (token & 31u);
+        }
+
+        inline uint tq_bitset_offset_v7(
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint word,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint bitset_words_per_group
+        ) {
+            uint words_per_token = groups_per_vector * bitset_words_per_group;
+            uint plane_base = (batch * kv_heads + head) * capacity * words_per_token;
+            uint tile_base = plane_base + (token & ~31u) * words_per_token;
+            return tile_base + ((group * bitset_words_per_group + word) << 5) + (token & 31u);
+        }
+
+        inline uint tq_scale_offset_v7(
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint scale_index,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector
+        ) {
+            uint scales_per_token = groups_per_vector * 2u;
+            uint plane_base = (batch * kv_heads + head) * capacity * scales_per_token;
+            uint tile_base = plane_base + (token & ~31u) * scales_per_token;
+            return tile_base + ((group * 2u + scale_index) << 5) + (token & 31u);
+        }
+
+        template <typename PackedPtr>
+        inline uint tq_read_packed_unsigned_v7(
+            PackedPtr packed,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint bit_offset,
+            uint bits,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint packed_word = bit_offset >> 5;
+            uint packed_bit = bit_offset & 31u;
+            uint first = packed[tq_packed_offset_v7(
+                batch, head, token, group, packed_word,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group)] >> packed_bit;
+            if (packed_bit + bits > 32u) {
+                uint next = packed[tq_packed_offset_v7(
+                    batch, head, token, group, packed_word + 1u,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group)];
+                first |= next << (32u - packed_bit);
+            }
+            return first & ((1u << bits) - 1u);
+        }
+
+        template <typename PackedPtr>
+        inline void tq_write_packed_unsigned_v7(
+            PackedPtr packed,
+            uint quantized,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint bit_offset,
+            uint bits,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint packed_word = bit_offset >> 5;
+            uint packed_bit = bit_offset & 31u;
+            uint mask = ((1u << bits) - 1u);
+            uint value = quantized & mask;
+            packed[tq_packed_offset_v7(
+                batch, head, token, group, packed_word,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
+                value << packed_bit;
+            if (packed_bit + bits > 32u) {
+                packed[tq_packed_offset_v7(
+                    batch, head, token, group, packed_word + 1u,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
+                    value >> (32u - packed_bit);
+            }
+        }
+
+        template <
+            typename PackedPtr,
+            typename SignsPtr,
+            typename HighMaskPtr,
+            typename ResidualSignsPtr,
+            typename ScalesPtr
+        >
+        inline void tq_product_attention_inner_product_group_pair_v7(
+            PackedPtr packed,
+            SignsPtr signs,
+            HighMaskPtr high_mask,
+            ResidualSignsPtr residual_signs,
+            ScalesPtr scales,
+            thread float* query_values,
+            thread float* scores,
+            uint pair_repeats,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            ulong seed,
+            uint group_size,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group,
+            uint bitset_words_per_group,
+            uint key_base_bits,
+            uint key_high_bits,
+            uint layout_version,
+            uint head_dim,
+            uint high_count,
+            bool query_prerotated
+        ) {
+            uint group_start = group * group_size;
+            uint count = min(group_size, head_dim - group_start);
+            uint storage_group = tq_storage_group_index(
+                batch, head, token, group, kv_heads, capacity, groups_per_vector);
+            uint repeats = min(pair_repeats, 2u);
+
+            if (!query_prerotated) {
+                for (uint repeat = 0u; repeat < repeats; repeat++) {
+                    tq_apply_product_rotation(
+                        query_values + repeat * group_size, count, seed, storage_group, false);
+                }
+            }
+
+            float quantized_dot[2];
+            float sign_dot[2];
+            quantized_dot[0] = 0.0f;
+            quantized_dot[1] = 0.0f;
+            sign_dot[0] = 0.0f;
+            sign_dot[1] = 0.0f;
+            // TQPROF_OPT/OPT2/OPT3 packed-word caches (hoisted base + base-stream slot + extra-bit
+            // slot), mirroring the quad estimator so all three decode branches avoid per-element
+            // packed reloads.
+            uint tqopt_packed_base = tq_packed_offset_v7(
+                batch, head, token, group, 0u,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
+            uint tqopt_cached_idx = 0xffffffffu;
+            uint tqopt_cached_val = 0u;
+            uint tqopt_extra_idx = 0xffffffffu;
+            uint tqopt_extra_val = 0u;
+            uint cached_bitset_word = 0xffffffffu;
+            uint cached_sign_bits = 0u;
+            uint cached_high_word = 0xffffffffu;
+            uint cached_high_bits = 0u;
+            uint bit_offset = 0u;
+            bool split_magnitude =
+                layout_version >= 6u
+                && key_high_bits == key_base_bits + 1u
+                && key_high_bits > key_base_bits;
+            float inv_sqrt_count = rsqrt(float(max(count, 1u)));
+
+            for (uint local = 0u; local < count; local++) {
+                uint bitset_word = local >> 5;
+                uint bitset_bit = local & 31u;
+                uint bit_mask = 1u << bitset_bit;
+                if (bitset_word != cached_bitset_word) {
+                    cached_bitset_word = bitset_word;
+                    cached_sign_bits = signs[tq_bitset_offset_v7(
+                        batch, head, token, group, bitset_word,
+                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                }
+                uint bits = key_base_bits;
+                uint code = 0u;
+                if (split_magnitude) {
+                    bool high_precision = tq_split_high_precision(local, high_count);
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    // TQPROF_OPT3 split-magnitude fast path: cache the base-bits stream (offset
+                    // local*key_base_bits, uniform stride) and the high-precision extra-bit stream
+                    // (offset group_size*key_base_bits+local, stride 1) in two slots, instead of the
+                    // two per-element tq_read_packed_unsigned reloads. Bit-exact. This is the live
+                    // turbo3_5 path (verified by negation litmus).
+                    uint base_bo = local * key_base_bits;
+                    uint base_pw = base_bo >> 5;
+                    uint base_pbit = base_bo & 31u;
+                    if (base_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = base_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (base_pw << 5)];
+                    }
+                    uint base_asm = tqopt_cached_val >> base_pbit;
+                    if (base_pbit + key_base_bits > 32u) {
+                        base_asm |= packed[tqopt_packed_base + ((base_pw + 1u) << 5)] << (32u - base_pbit);
+                    }
+                    code = base_asm & ((1u << key_base_bits) - 1u);
+                    if (high_precision) {
+                        uint extra_bits = key_high_bits - key_base_bits;
+                        uint extra_bo = group_size * key_base_bits + local;
+                        uint extra_pw = extra_bo >> 5;
+                        uint extra_pbit = extra_bo & 31u;
+                        if (extra_pw != tqopt_extra_idx) {
+                            tqopt_extra_idx = extra_pw;
+                            tqopt_extra_val = packed[tqopt_packed_base + (extra_pw << 5)];
+                        }
+                        uint extra_asm = tqopt_extra_val >> extra_pbit;
+                        if (extra_pbit + extra_bits > 32u) {
+                            extra_asm |= packed[tqopt_packed_base + ((extra_pw + 1u) << 5)] << (32u - extra_pbit);
+                        }
+                        uint extra_code = extra_asm & ((1u << extra_bits) - 1u);
+                        code |= extra_code << key_base_bits;
+                    }
+                } else if (key_high_bits > key_base_bits) {
+                    if (bitset_word != cached_high_word) {
+                        cached_high_word = bitset_word;
+                        cached_high_bits = high_mask[tq_bitset_offset_v7(
+                            batch, head, token, group, bitset_word,
+                            kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                    }
+                    bool high_precision = (cached_high_bits & bit_mask) != 0u;
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    code = tq_read_packed_unsigned_v7(
+                        packed, batch, head, token, group, bit_offset, bits,
+                        kv_heads, capacity, groups_per_vector, mag_words_per_group);
+                    bit_offset += bits;
+                } else {
+                    code = tq_read_packed_unsigned_v7(
+                        packed, batch, head, token, group, bit_offset, bits,
+                        kv_heads, capacity, groups_per_vector, mag_words_per_group);
+                    bit_offset += bits;
+                }
+                float level = tq_codebook_unit(bits, code) * inv_sqrt_count;
+                float qjl_sign = (cached_sign_bits & bit_mask) != 0u ? -1.0f : 1.0f;
+                for (uint repeat = 0u; repeat < repeats; repeat++) {
+                    float query_value = query_values[repeat * group_size + local];
+                    quantized_dot[repeat] += query_value * level;
+                    sign_dot[repeat] += qjl_sign * query_value;
+                }
+            }
+
+            float norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)];
+            float residual_norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)];
+            float residual_scale = residual_norm * sqrt(3.14159265358979323846f / (2.0f * float(count)));
+            for (uint repeat = 0u; repeat < repeats; repeat++) {
+                scores[repeat] += norm * quantized_dot[repeat] + residual_scale * sign_dot[repeat];
+            }
+        }
+
+        template <
+            typename PackedPtr,
+            typename SignsPtr,
+            typename HighMaskPtr,
+            typename ResidualSignsPtr,
+            typename ScalesPtr
+        >
+        inline void tq_product_attention_inner_product_group_quad_v7(
+            PackedPtr packed,
+            SignsPtr signs,
+            HighMaskPtr high_mask,
+            ResidualSignsPtr residual_signs,
+            ScalesPtr scales,
+            thread float* query_values,
+            thread float* scores,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            ulong seed,
+            uint group_size,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group,
+            uint bitset_words_per_group,
+            uint key_base_bits,
+            uint key_high_bits,
+            uint layout_version,
+            uint head_dim,
+            uint high_count,
+            bool query_prerotated
+        ) {
+            uint group_start = group * group_size;
+            uint count = min(group_size, head_dim - group_start);
+            uint storage_group = tq_storage_group_index(
+                batch, head, token, group, kv_heads, capacity, groups_per_vector);
+
+            if (!query_prerotated) {
+                for (uint repeat = 0u; repeat < 4u; repeat++) {
+                    tq_apply_product_rotation(
+                        query_values + repeat * group_size, count, seed, storage_group, false);
+                }
+            }
+
+            float quantized_dot[4];
+            float sign_dot[4];
+            for (uint repeat = 0u; repeat < 4u; repeat++) {
+                quantized_dot[repeat] = 0.0f;
+                sign_dot[repeat] = 0.0f;
+            }
+            // TQPROF_OPT hoist invariant packed base + cache packed word across uniform codes
+            uint tqopt_packed_base = tq_packed_offset_v7(
+                batch, head, token, group, 0u,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
+            uint tqopt_cached_idx = 0xffffffffu;
+            uint tqopt_cached_val = 0u;
+            // Second cache slot for the split-magnitude high-precision (extra-bit) stream, which
+            // lives in a separate region of the packed buffer from the base-bits stream.
+            uint tqopt_extra_idx = 0xffffffffu;
+            uint tqopt_extra_val = 0u;
+            uint cached_bitset_word = 0xffffffffu;
+            uint cached_sign_bits = 0u;
+            uint cached_high_word = 0xffffffffu;
+            uint cached_high_bits = 0u;
+            uint bit_offset = 0u;
+            bool split_magnitude =
+                layout_version >= 6u
+                && key_high_bits == key_base_bits + 1u
+                && key_high_bits > key_base_bits;
+            float inv_sqrt_count = rsqrt(float(max(count, 1u)));
+
+            for (uint local = 0u; local < count; local++) {
+                uint bitset_word = local >> 5;
+                uint bitset_bit = local & 31u;
+                uint bit_mask = 1u << bitset_bit;
+                if (bitset_word != cached_bitset_word) {
+                    cached_bitset_word = bitset_word;
+                    cached_sign_bits = signs[tq_bitset_offset_v7(
+                        batch, head, token, group, bitset_word,
+                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                }
+                uint bits = key_base_bits;
+                uint code = 0u;
+                if (split_magnitude) {
+                    bool high_precision = tq_split_high_precision(local, high_count);
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    // TQPROF_OPT3 split-magnitude fast path: cache the base-bits stream (offset
+                    // local*key_base_bits, uniform stride) and the high-precision extra-bit stream
+                    // (offset group_size*key_base_bits+local, stride 1) in two slots, instead of the
+                    // two per-element tq_read_packed_unsigned reloads. Bit-exact. This is the live
+                    // turbo3_5 path (verified by negation litmus).
+                    uint base_bo = local * key_base_bits;
+                    uint base_pw = base_bo >> 5;
+                    uint base_pbit = base_bo & 31u;
+                    if (base_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = base_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (base_pw << 5)];
+                    }
+                    uint base_asm = tqopt_cached_val >> base_pbit;
+                    if (base_pbit + key_base_bits > 32u) {
+                        base_asm |= packed[tqopt_packed_base + ((base_pw + 1u) << 5)] << (32u - base_pbit);
+                    }
+                    code = base_asm & ((1u << key_base_bits) - 1u);
+                    if (high_precision) {
+                        uint extra_bits = key_high_bits - key_base_bits;
+                        uint extra_bo = group_size * key_base_bits + local;
+                        uint extra_pw = extra_bo >> 5;
+                        uint extra_pbit = extra_bo & 31u;
+                        if (extra_pw != tqopt_extra_idx) {
+                            tqopt_extra_idx = extra_pw;
+                            tqopt_extra_val = packed[tqopt_packed_base + (extra_pw << 5)];
+                        }
+                        uint extra_asm = tqopt_extra_val >> extra_pbit;
+                        if (extra_pbit + extra_bits > 32u) {
+                            extra_asm |= packed[tqopt_packed_base + ((extra_pw + 1u) << 5)] << (32u - extra_pbit);
+                        }
+                        uint extra_code = extra_asm & ((1u << extra_bits) - 1u);
+                        code |= extra_code << key_base_bits;
+                    }
+                } else if (key_high_bits > key_base_bits) {
+                    if (bitset_word != cached_high_word) {
+                        cached_high_word = bitset_word;
+                        cached_high_bits = high_mask[tq_bitset_offset_v7(
+                            batch, head, token, group, bitset_word,
+                            kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                    }
+                    bool high_precision = (cached_high_bits & bit_mask) != 0u;
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    // TQPROF_OPT2 variable-bit fast path: reuse the same packed-word cache as the
+                    // uniform branch. Valid because bit_offset advances monotonically over a single
+                    // contiguous magnitude bitstream even though `bits` varies per element, so
+                    // consecutive variable-width codes still share 32-bit words. Removes the
+                    // per-element packed reload that tq_read_packed_unsigned did (turbo3_5 path).
+                    uint tqopt_pw = bit_offset >> 5;
+                    uint tqopt_pbit = bit_offset & 31u;
+                    if (tqopt_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = tqopt_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (tqopt_pw << 5)];
+                    }
+                    uint tqopt_asm = tqopt_cached_val >> tqopt_pbit;
+                    if (tqopt_pbit + bits > 32u) {
+                        tqopt_asm |= packed[tqopt_packed_base + ((tqopt_pw + 1u) << 5)] << (32u - tqopt_pbit);
+                    }
+                    code = tqopt_asm & ((1u << bits) - 1u);
+                    bit_offset += bits;
+                } else {
+                    // TQPROF_OPT cached uniform-width packed read (1 load per 32/bits codes)
+                    uint tqopt_pw = bit_offset >> 5;
+                    uint tqopt_pbit = bit_offset & 31u;
+                    if (tqopt_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = tqopt_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (tqopt_pw << 5)];
+                    }
+                    uint tqopt_asm = tqopt_cached_val >> tqopt_pbit;
+                    if (tqopt_pbit + bits > 32u) {
+                        tqopt_asm |= packed[tqopt_packed_base + ((tqopt_pw + 1u) << 5)] << (32u - tqopt_pbit);
+                    }
+                    code = tqopt_asm & ((1u << bits) - 1u);
+                    bit_offset += bits;
+                }
+                float level = tq_codebook_unit(bits, code) * inv_sqrt_count;
+                float qjl_sign = (cached_sign_bits & bit_mask) != 0u ? -1.0f : 1.0f;
+                for (uint repeat = 0u; repeat < 4u; repeat++) {
+                    float query_value = query_values[repeat * group_size + local];
+                    quantized_dot[repeat] += query_value * level;
+                    sign_dot[repeat] += qjl_sign * query_value;
+                }
+            }
+
+            float norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)];
+            float residual_norm = scales[tq_scale_offset_v7(
                 batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)];
             float residual_scale = residual_norm * sqrt(3.14159265358979323846f / (2.0f * float(count)));
             for (uint repeat = 0u; repeat < 4u; repeat++) {
@@ -5048,10 +5498,11 @@ inline constexpr std::string_view turbo_quant_sparse_block_sum_reduce_source = R
 )TQMLX";
 
 inline constexpr std::string_view turbo_quant_block_partials_source = R"TQMLX(        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
         uint lane = thread_position_in_threadgroup.x;
         uint group_index = threadgroup_position_in_grid.x;
-        uint block_index = group_index % uint(BLOCK_COUNT);
-        uint row = group_index / uint(BLOCK_COUNT);
+        uint block_index = group_index % block_count;
+        uint row = group_index / block_count;
         uint total_rows = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH);
         if (row >= total_rows) {
             return;
@@ -5075,12 +5526,12 @@ inline constexpr std::string_view turbo_quant_block_partials_source = R"TQMLX(  
         uint block_start = block_index * uint(BLOCK_TOKENS);
         if (DO_CAUSAL && block_start > causal_limit) {
             if (lane == 0u) {
-                uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+                uint stat_index = ((row * block_count + block_index) * 2u);
                 partial_stats[stat_index] = -INFINITY;
                 partial_stats[stat_index + 1u] = 0.0f;
             }
             if (lane < uint(HEAD_DIM)) {
-                uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
                 partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
             }
             return;
@@ -5154,7 +5605,7 @@ inline constexpr std::string_view turbo_quant_block_partials_source = R"TQMLX(  
         }
 
         if (lane == 0u) {
-            uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+            uint stat_index = ((row * block_count + block_index) * 2u);
             partial_stats[stat_index] = tile_max;
             partial_stats[stat_index + 1u] = partial[0];
         }
@@ -5177,17 +5628,18 @@ inline constexpr std::string_view turbo_quant_block_partials_source = R"TQMLX(  
                     dimension_accum += weight * value;
                 }
             }
-            uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+            uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
             partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum);
         }
 )TQMLX";
 
-inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQMLX(        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+inline constexpr std::string_view turbo_quant_gqa_block_partials_rf1_source = R"TQMLX(        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
         constexpr uint gqa_repeats = uint(GQA_REPEATS);
         uint lane = thread_position_in_threadgroup.x;
         uint group_index = threadgroup_position_in_grid.x;
-        uint block_index = group_index % uint(BLOCK_COUNT);
-        uint gqa_row = group_index / uint(BLOCK_COUNT);
+        uint block_index = group_index % block_count;
+        uint gqa_row = group_index / block_count;
         uint total_gqa_rows = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(QUERY_LENGTH);
         if (gqa_row >= total_gqa_rows) {
             return;
@@ -5217,7 +5669,7 @@ inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQML
                 for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                     uint q_head = kv_head * gqa_repeats + repeat;
                     uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                    uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+                    uint stat_index = ((row * block_count + block_index) * 2u);
                     partial_stats[stat_index] = -INFINITY;
                     partial_stats[stat_index + 1u] = 0.0f;
                 }
@@ -5226,7 +5678,449 @@ inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQML
                 for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                     uint q_head = kv_head * gqa_repeats + repeat;
                     uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                    uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+                    uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                    partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
+                }
+            }
+            return;
+        }
+        ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
+        ulong value_seed = tq_make_seed(
+            uint(VALUE_SEED_3), uint(VALUE_SEED_2),
+            uint(VALUE_SEED_1), uint(VALUE_SEED_0));
+
+        if (lane < uint(HEAD_DIM)) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                long q_index =
+                    long(batch) * q_strides[0]
+                    + long(q_head) * q_strides[1]
+                    + long(q_token) * q_strides[2]
+                    + long(lane) * q_strides[3];
+                query_cache[repeat * uint(HEAD_DIM) + lane] = float(q[q_index]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Part B: rotate the query ONCE per (repeat, group) and reuse it across every key
+        // token. Because the rotation seed is token-independent (see tq_storage_group_index),
+        // the rotation is identical for all keys, so hoisting it here turns the prior O(N)
+        // per-key query rotations into O(repeat_count * groups_per_vector) per attention step.
+        {
+            uint rg_total = repeat_count * uint(GROUPS_PER_VECTOR);
+            if (lane < rg_total) {
+                uint r = lane / uint(GROUPS_PER_VECTOR);
+                uint g = lane % uint(GROUPS_PER_VECTOR);
+                uint gs = g * uint(GROUP_SIZE);
+                uint cnt = min(uint(GROUP_SIZE), uint(HEAD_DIM) - gs);
+                uint rot_seed_index = tq_storage_group_index(
+                    batch, kv_head, 0u, g, uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR));
+                thread float tmp[GROUP_SIZE];
+                for (uint i = 0u; i < cnt; i++) {
+                    tmp[i] = query_cache[r * uint(HEAD_DIM) + gs + i];
+                }
+                tq_apply_product_rotation(tmp, cnt, key_seed, rot_seed_index, false);
+                for (uint i = 0u; i < cnt; i++) {
+                    query_cache[r * uint(HEAD_DIM) + gs + i] = tmp[i];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        constexpr uint lanes_per_token = uint(LANES_PER_TOKEN);
+        uint physical_token = 0u;
+        bool active = false;
+        thread float scaled_scores[4];
+        scaled_scores[0] = -INFINITY;
+        scaled_scores[1] = -INFINITY;
+        scaled_scores[2] = -INFINITY;
+        scaled_scores[3] = -INFINITY;
+
+        if (lanes_per_token == 4u) {
+            // TQCOOP cooperative quad-per-key coalesced decode (turbo8 uniform path).
+            // 4 lanes cooperate on one key, each decoding a contiguous HEAD_DIM/4 chunk
+            // (so the quad's 4 chunks tile one cache line -> coalesced, ~4x less L1
+            // pressure than the strided 1-thread-per-token mapping). Each quad walks 4
+            // tokens in 4 passes; lane j keeps the score of pass j so the existing
+            // per-lane back-half (tile_scores[lane], reductions, AV) is unchanged.
+            uint lane_in_quad = lane & 3u;
+            uint quad_id = lane >> 2u;
+            uint num_quads = uint(THREADS_PER_BLOCK) >> 2u;
+            uint dims_per_lane = uint(HEAD_DIM) / 4u;
+            uint dim_start = lane_in_quad * dims_per_lane;
+            uint g = dim_start / uint(GROUP_SIZE);
+            uint local_start = dim_start - g * uint(GROUP_SIZE);
+            uint count_g = min(uint(GROUP_SIZE), uint(HEAD_DIM) - g * uint(GROUP_SIZE));
+            float inv_sqrt_count = rsqrt(float(max(count_g, 1u)));
+            float residual_scale_factor =
+                sqrt(3.14159265358979323846f / (2.0f * float(count_g)));
+            constexpr uint coop_base_bits = uint(KEY_BASE_BITS);
+            constexpr uint coop_high_bits = uint(KEY_HIGH_BITS);
+            // Coop handles uniform (turbo8/turbo4v2: base==high) AND split-magnitude
+            // (turbo3_5: high==base+1 at layout v6 — a base-bits stream + a 1-bit high stream,
+            // both per-group contiguous, so each lane's chunk still coalesces). Branch-2
+            // variable-bit is dead at v6 and gated out, so these two cases are exhaustive.
+            constexpr bool coop_split =
+                uint(LAYOUT_VERSION) >= 6u && coop_high_bits == coop_base_bits + 1u;
+            uint coop_high_count = coop_split
+                ? tq_high_precision_count(
+                    count_g, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR))
+                : 0u;
+            uint my_token = 0u;
+            for (uint j = 0u; j < 4u; j++) {
+                uint logical_token = block_start + quad_id + j * num_quads;
+                bool tok_active = logical_token < logical_length
+                    && (!DO_CAUSAL || logical_token <= causal_limit);
+                thread float ts[4];
+                ts[0] = 0.0f; ts[1] = 0.0f; ts[2] = 0.0f; ts[3] = 0.0f;
+                uint phys = 0u;
+                if (tok_active) {
+                    phys = tq_physical_token(
+                        logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+                    uint base = tq_packed_offset(
+                        batch, kv_head, phys, g, 0u,
+                        uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP));
+                    uint cached_idx = 0xffffffffu;
+                    uint cached_val = 0u;
+                    uint extra_idx = 0xffffffffu;
+                    uint extra_val = 0u;
+                    uint cached_bw = 0xffffffffu;
+                    uint cached_sign = 0u;
+                    thread float qd[4];
+                    thread float sd[4];
+                    qd[0] = 0.0f; qd[1] = 0.0f; qd[2] = 0.0f; qd[3] = 0.0f;
+                    sd[0] = 0.0f; sd[1] = 0.0f; sd[2] = 0.0f; sd[3] = 0.0f;
+                    for (uint i = 0u; i < dims_per_lane; i++) {
+                        uint local = local_start + i;
+                        uint dim = dim_start + i;
+                        uint bits;
+                        uint code;
+                        if (coop_split) {
+                            bool hp = local < coop_high_count;
+                            bits = hp ? coop_high_bits : coop_base_bits;
+                            uint base_bo = local * coop_base_bits;
+                            uint base_pw = base_bo >> 5;
+                            uint base_pb = base_bo & 31u;
+                            if (base_pw != cached_idx) {
+                                cached_idx = base_pw;
+                                cached_val = k_packed[base + base_pw];
+                            }
+                            uint base_asm = cached_val >> base_pb;
+                            if (base_pb + coop_base_bits > 32u) {
+                                base_asm |= k_packed[base + base_pw + 1u] << (32u - base_pb);
+                            }
+                            code = base_asm & ((1u << coop_base_bits) - 1u);
+                            if (hp) {
+                                uint extra_bits = coop_high_bits - coop_base_bits;
+                                uint extra_bo = uint(GROUP_SIZE) * coop_base_bits + local;
+                                uint extra_pw = extra_bo >> 5;
+                                uint extra_pb = extra_bo & 31u;
+                                if (extra_pw != extra_idx) {
+                                    extra_idx = extra_pw;
+                                    extra_val = k_packed[base + extra_pw];
+                                }
+                                uint extra_asm = extra_val >> extra_pb;
+                                if (extra_pb + extra_bits > 32u) {
+                                    extra_asm |=
+                                        k_packed[base + extra_pw + 1u] << (32u - extra_pb);
+                                }
+                                code |= (extra_asm & ((1u << extra_bits) - 1u)) << coop_base_bits;
+                            }
+                        } else {
+                            bits = coop_base_bits;
+                            uint bo = local * coop_base_bits;
+                            uint pw = bo >> 5;
+                            uint pb = bo & 31u;
+                            if (pw != cached_idx) {
+                                cached_idx = pw;
+                                cached_val = k_packed[base + pw];
+                            }
+                            uint aw = cached_val >> pb;
+                            if (pb + coop_base_bits > 32u) {
+                                aw |= k_packed[base + pw + 1u] << (32u - pb);
+                            }
+                            code = aw & ((1u << coop_base_bits) - 1u);
+                        }
+                        uint bw = local >> 5;
+                        if (bw != cached_bw) {
+                            cached_bw = bw;
+                            cached_sign = k_signs[tq_bitset_offset(
+                                batch, kv_head, phys, g, bw,
+                                uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                                uint(BITSET_WORDS_PER_GROUP))];
+                        }
+                        float level = tq_codebook_unit(bits, code) * inv_sqrt_count;
+                        float sgn = (cached_sign & (1u << (local & 31u))) != 0u ? -1.0f : 1.0f;
+                        // COOPW invariant: rows [repeat_count, 4) of query_cache are
+                        // NEVER initialized by the shared prologue (init loop and rotation
+                        // are both bounded by repeat_count). Clamping every coop r-loop to
+                        // repeat_count is load-bearing: the hardcoded r<4u form read those
+                        // uninitialized threadgroup rows (UB, shader-validation trap risk).
+                        // At repeat_count==4 the bound is unchanged -> byte-identical.
+                        for (uint r = 0u; r < repeat_count; r++) {
+                            float qv = query_cache[r * uint(HEAD_DIM) + dim];
+                            qd[r] += qv * level;
+                            sd[r] += sgn * qv;
+                        }
+                    }
+                    float norm = k_scales[tq_scale_offset(
+                        batch, kv_head, phys, g, 0u,
+                        uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR))];
+                    float residual_norm = k_scales[tq_scale_offset(
+                        batch, kv_head, phys, g, 1u,
+                        uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR))];
+                    float residual_scale = residual_norm * residual_scale_factor;
+                    for (uint r = 0u; r < repeat_count; r++) {
+                        ts[r] = norm * qd[r] + residual_scale * sd[r];
+                    }
+                }
+                for (uint r = 0u; r < repeat_count; r++) {
+                    ts[r] += simd_shuffle_xor(ts[r], 1u);
+                    ts[r] += simd_shuffle_xor(ts[r], 2u);
+                }
+                if (lane_in_quad == j) {
+                    active = tok_active;
+                    my_token = tok_active ? phys : 0u;
+                    for (uint r = 0u; r < repeat_count; r++) {
+                        scaled_scores[r] = tok_active ? ts[r] * attention_scale : -INFINITY;
+                    }
+                }
+            }
+            physical_token = my_token;
+        } else {
+        uint logical_token = block_start + lane;
+        active = lane < uint(BLOCK_TOKENS)
+            && logical_token < logical_length
+            && (!DO_CAUSAL || logical_token <= causal_limit);
+
+        if (active) {
+            physical_token = tq_physical_token(
+                logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] = 0.0f;
+            }
+            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
+                uint group_start = group * uint(GROUP_SIZE);
+                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
+                if (repeat_count == 4u) {
+                    thread float query_values[4 * GROUP_SIZE];
+                    thread float quad_scores[4];
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        quad_scores[repeat] = 0.0f;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[repeat * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_quad(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        quad_scores,
+                        batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        scaled_scores[repeat] += quad_scores[repeat];
+                    }
+                    continue;
+                }
+                for (uint pair_start = 0u; pair_start < repeat_count; pair_start += 2u) {
+                    uint pair_repeats = min(2u, repeat_count - pair_start);
+                    thread float query_values[2 * GROUP_SIZE];
+                    thread float pair_scores[2];
+                    pair_scores[0] = 0.0f;
+                    pair_scores[1] = 0.0f;
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        uint repeat = pair_start + pair;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[pair * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_pair(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        pair_scores,
+                        pair_repeats, batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        scaled_scores[pair_start + pair] += pair_scores[pair];
+                    }
+                }
+            }
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] *= attention_scale;
+            }
+        }
+        }
+        tile_physical_tokens[lane] = physical_token;
+
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            tile_scores[score_base + lane] = scaled_scores[repeat];
+            partial[score_base + lane] = scaled_scores[repeat];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    partial[score_base + lane] =
+                        max(partial[score_base + lane], partial[score_base + lane + stride]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        thread float tile_maxes[4];
+        tile_maxes[0] = -INFINITY;
+        tile_maxes[1] = -INFINITY;
+        tile_maxes[2] = -INFINITY;
+        tile_maxes[3] = -INFINITY;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            tile_maxes[repeat] = partial[repeat * threads_per_block];
+        }
+        // Every lane must finish reading the reduced maxes above BEFORE any lane
+        // overwrites partial[] with exp-weights below. Without this barrier, a lagging
+        // simdgroup can read lane 0's already-written weight as the "max" for a later
+        // repeat (drift across the barrier-free repeat loop is widest at the last
+        // repeat), which intermittently corrupts the whole output row of one GQA
+        // repeat at BT>=512 / 131072 (256 active blocks). Root-caused 2026-07-06 as
+        // the same class as the v7 quad race; see
+        // artifacts/turboquant-w2-regrad-20260706 and
+        // artifacts/turboquant-v7-20260703/quad-nondeterminism.md.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint has_weight = 0u;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            float tile_weight = active
+                ? exp(tile_scores[score_base + lane] - tile_maxes[repeat])
+                : 0.0f;
+            tile_scores[score_base + lane] = tile_weight;
+            partial[score_base + lane] = tile_weight;
+            if (tile_weight > 0.0f) {
+                has_weight = 1u;
+            }
+        }
+        tile_has_weight[lane] = has_weight;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    partial[score_base + lane] += partial[score_base + lane + stride];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint stat_index = ((row * block_count + block_index) * 2u);
+                uint score_base = repeat * threads_per_block;
+                partial_stats[stat_index] = tile_maxes[repeat];
+                partial_stats[stat_index + 1u] = partial[score_base];
+            }
+        }
+
+        if (lane < uint(HEAD_DIM)) {
+            thread float decode_scratch[GROUP_SIZE];
+            thread float dimension_accum[4];
+            dimension_accum[0] = 0.0f;
+            dimension_accum[1] = 0.0f;
+            dimension_accum[2] = 0.0f;
+            dimension_accum[3] = 0.0f;
+
+            for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
+                if (tile_has_weight[tile_lane] != 0u) {
+                    float value = tq_decode_attention_value(
+                        v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
+                        batch, kv_head, tile_physical_tokens[tile_lane], lane,
+                        value_seed, 1u,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
+                        uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS),
+                        uint(LAYOUT_VERSION), uint(HEAD_DIM), 0u,
+                        decode_scratch);
+                    for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                        dimension_accum[repeat] +=
+                            tile_scores[repeat * threads_per_block + tile_lane] * value;
+                    }
+                }
+            }
+
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum[repeat]);
+            }
+        }
+)TQMLX";
+
+inline constexpr std::string_view turbo_quant_gqa_block_partials_h16_rf1_source = R"TQMLX(        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
+        constexpr uint gqa_repeats = uint(GQA_REPEATS);
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint block_index = group_index % block_count;
+        uint gqa_row = group_index / block_count;
+        uint total_gqa_rows = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(QUERY_LENGTH);
+        if (gqa_row >= total_gqa_rows) {
+            return;
+        }
+
+        // T2.2 H16 diet: partial/tile_scores staged as half (was float) and
+        // tile_has_weight folded into a 32-lane bitset (was uint[THREADS_PER_BLOCK]).
+        // This halves the two largest tgmem arrays and shrinks the mask array from
+        // THREADS_PER_BLOCK*4B to (THREADS_PER_BLOCK/32)*4B, clearing the < 16384 B
+        // static-tgmem boundary needed for 2 threadgroups/core (see G5 probe). All
+        // reduction math still runs in fp32 registers; only the threadgroup-memory
+        // storage dtype changes. query_cache and tile_physical_tokens are unchanged
+        // (rotation precision / full 32-bit token indices at 131K).
+        threadgroup half partial[4 * THREADS_PER_BLOCK];
+        threadgroup half tile_scores[4 * THREADS_PER_BLOCK];
+        threadgroup uint tile_has_weight_bits[(THREADS_PER_BLOCK + 31u) / 32u];
+        threadgroup uint tile_physical_tokens[THREADS_PER_BLOCK];
+        threadgroup float query_cache[4 * HEAD_DIM];
+
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        float attention_scale = float(runtime_attention_scale);
+        uint q_token = gqa_row % uint(QUERY_LENGTH);
+        uint kv_head = (gqa_row / uint(QUERY_LENGTH)) % uint(KV_HEADS);
+        uint batch = gqa_row / (uint(QUERY_LENGTH) * uint(KV_HEADS));
+        uint causal_limit = logical_length - uint(QUERY_LENGTH) + q_token;
+        uint block_start = block_index * uint(BLOCK_TOKENS);
+        constexpr uint repeat_count = uint(GQA_REPEATS) < 4u ? uint(GQA_REPEATS) : 4u;
+        if (DO_CAUSAL && block_start > causal_limit) {
+            if (lane == 0u) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint stat_index = ((row * block_count + block_index) * 2u);
+                    partial_stats[stat_index] = -INFINITY;
+                    partial_stats[stat_index + 1u] = 0.0f;
+                }
+            }
+            if (lane < uint(HEAD_DIM)) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
                     partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
                 }
             }
@@ -5507,6 +6401,303 @@ inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQML
 
         for (uint repeat = 0u; repeat < repeat_count; repeat++) {
             uint score_base = repeat * threads_per_block;
+            // H16 overflow guard: the raw pre-softmax logit is unbounded and is
+            // stored as half before the max-subtraction. Clamp to a safe fp16
+            // sub-max range; -INFINITY (masked/inactive lanes) maps to -65504,
+            // which the exp(x - max) step drives to 0 identically to -inf.
+            float raw = scaled_scores[repeat];
+            float guarded = raw;
+            if (!(raw <= 60000.0f)) {
+                guarded = (raw == -INFINITY) ? -65504.0f : 60000.0f;
+            } else if (raw < -65504.0f) {
+                guarded = -65504.0f;
+            }
+            tile_scores[score_base + lane] = half(guarded);
+            partial[score_base + lane] = half(guarded);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    float a = float(partial[score_base + lane]);
+                    float b = float(partial[score_base + lane + stride]);
+                    partial[score_base + lane] = half(max(a, b));
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        thread float tile_maxes[4];
+        tile_maxes[0] = -INFINITY;
+        tile_maxes[1] = -INFINITY;
+        tile_maxes[2] = -INFINITY;
+        tile_maxes[3] = -INFINITY;
+        // Clear this lane's bitset word once (only the 32 lane-0-of-word threads).
+        if ((lane & 31u) == 0u) { tile_has_weight_bits[lane >> 5] = 0u; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            tile_maxes[repeat] = float(partial[repeat * threads_per_block]);
+        }
+        // Read the reduced maxes above BEFORE any lane overwrites partial[] with
+        // exp-weights below (same v6-family RAW race fixed in the fp32 GQA kernel;
+        // see artifacts/turboquant-w2-regrad-20260706).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint has_weight = 0u;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            float tile_weight = active
+                ? exp(float(tile_scores[score_base + lane]) - tile_maxes[repeat])
+                : 0.0f;
+            tile_scores[score_base + lane] = half(tile_weight);
+            partial[score_base + lane] = half(tile_weight);
+            if (tile_weight > 0.0f) {
+                has_weight = 1u;
+            }
+        }
+        if (has_weight != 0u) {
+            atomic_fetch_or_explicit(
+                (threadgroup atomic_uint*)&tile_has_weight_bits[lane >> 5],
+                1u << (lane & 31u), memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    float s = float(partial[score_base + lane])
+                            + float(partial[score_base + lane + stride]);
+                    partial[score_base + lane] = half(s);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint stat_index = ((row * block_count + block_index) * 2u);
+                uint score_base = repeat * threads_per_block;
+                partial_stats[stat_index] = tile_maxes[repeat];
+                partial_stats[stat_index + 1u] = float(partial[score_base]);
+            }
+        }
+
+        if (lane < uint(HEAD_DIM)) {
+            thread float decode_scratch[GROUP_SIZE];
+            thread float dimension_accum[4];
+            dimension_accum[0] = 0.0f;
+            dimension_accum[1] = 0.0f;
+            dimension_accum[2] = 0.0f;
+            dimension_accum[3] = 0.0f;
+
+            for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
+                if ((tile_has_weight_bits[tile_lane >> 5] & (1u << (tile_lane & 31u))) != 0u) {
+                    float value = tq_decode_attention_value(
+                        v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
+                        batch, kv_head, tile_physical_tokens[tile_lane], lane,
+                        value_seed, 1u,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
+                        uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS),
+                        uint(LAYOUT_VERSION), uint(HEAD_DIM), 0u,
+                        decode_scratch);
+                    for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                        dimension_accum[repeat] +=
+                            float(tile_scores[repeat * threads_per_block + tile_lane]) * value;
+                    }
+                }
+            }
+
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum[repeat]);
+            }
+        }
+)TQMLX";
+
+inline constexpr std::string_view turbo_quant_gqa_block_partials_v7_source = R"TQMLX(        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
+        constexpr uint gqa_repeats = uint(GQA_REPEATS);
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint block_index = group_index % block_count;
+        uint gqa_row = group_index / block_count;
+        uint total_gqa_rows = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(QUERY_LENGTH);
+        if (gqa_row >= total_gqa_rows) {
+            return;
+        }
+
+        // Sized to the actual threadgroup width (was a fixed 4*512 / 512) so threadgroup
+        // memory tracks the real block size — at blocks < 512 this frees enough threadgroup
+        // memory for multiple threadgroups to be resident per core, raising occupancy.
+        threadgroup float partial[4 * THREADS_PER_BLOCK];
+        threadgroup float tile_scores[4 * THREADS_PER_BLOCK];
+        threadgroup uint tile_has_weight[THREADS_PER_BLOCK];
+        threadgroup uint tile_physical_tokens[THREADS_PER_BLOCK];
+        threadgroup float query_cache[4 * HEAD_DIM];
+
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        float attention_scale = float(runtime_attention_scale);
+        uint q_token = gqa_row % uint(QUERY_LENGTH);
+        uint kv_head = (gqa_row / uint(QUERY_LENGTH)) % uint(KV_HEADS);
+        uint batch = gqa_row / (uint(QUERY_LENGTH) * uint(KV_HEADS));
+        uint causal_limit = logical_length - uint(QUERY_LENGTH) + q_token;
+        uint block_start = block_index * uint(BLOCK_TOKENS);
+        constexpr uint repeat_count = uint(GQA_REPEATS) < 4u ? uint(GQA_REPEATS) : 4u;
+        if (DO_CAUSAL && block_start > causal_limit) {
+            if (lane == 0u) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint stat_index = ((row * block_count + block_index) * 2u);
+                    partial_stats[stat_index] = -INFINITY;
+                    partial_stats[stat_index + 1u] = 0.0f;
+                }
+            }
+            if (lane < uint(HEAD_DIM)) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                    partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
+                }
+            }
+            return;
+        }
+        ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
+        ulong value_seed = tq_make_seed(
+            uint(VALUE_SEED_3), uint(VALUE_SEED_2),
+            uint(VALUE_SEED_1), uint(VALUE_SEED_0));
+
+        if (lane < uint(HEAD_DIM)) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                long q_index =
+                    long(batch) * q_strides[0]
+                    + long(q_head) * q_strides[1]
+                    + long(q_token) * q_strides[2]
+                    + long(lane) * q_strides[3];
+                query_cache[repeat * uint(HEAD_DIM) + lane] = float(q[q_index]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Part B: rotate the query ONCE per (repeat, group) and reuse it across every key
+        // token. Because the rotation seed is token-independent (see tq_storage_group_index),
+        // the rotation is identical for all keys, so hoisting it here turns the prior O(N)
+        // per-key query rotations into O(repeat_count * groups_per_vector) per attention step.
+        {
+            uint rg_total = repeat_count * uint(GROUPS_PER_VECTOR);
+            if (lane < rg_total) {
+                uint r = lane / uint(GROUPS_PER_VECTOR);
+                uint g = lane % uint(GROUPS_PER_VECTOR);
+                uint gs = g * uint(GROUP_SIZE);
+                uint cnt = min(uint(GROUP_SIZE), uint(HEAD_DIM) - gs);
+                uint rot_seed_index = tq_storage_group_index(
+                    batch, kv_head, 0u, g, uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR));
+                thread float tmp[GROUP_SIZE];
+                for (uint i = 0u; i < cnt; i++) {
+                    tmp[i] = query_cache[r * uint(HEAD_DIM) + gs + i];
+                }
+                tq_apply_product_rotation(tmp, cnt, key_seed, rot_seed_index, false);
+                for (uint i = 0u; i < cnt; i++) {
+                    query_cache[r * uint(HEAD_DIM) + gs + i] = tmp[i];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint physical_token = 0u;
+        bool active = false;
+        thread float scaled_scores[4];
+        scaled_scores[0] = -INFINITY;
+        scaled_scores[1] = -INFINITY;
+        scaled_scores[2] = -INFINITY;
+        scaled_scores[3] = -INFINITY;
+
+        uint logical_token = block_start + lane;
+        active = lane < uint(BLOCK_TOKENS)
+            && logical_token < logical_length
+            && (!DO_CAUSAL || logical_token <= causal_limit);
+
+        if (active) {
+            physical_token = tq_physical_token(
+                logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] = 0.0f;
+            }
+            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
+                uint group_start = group * uint(GROUP_SIZE);
+                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
+                if (repeat_count == 4u) {
+                    thread float query_values[4 * GROUP_SIZE];
+                    thread float quad_scores[4];
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        quad_scores[repeat] = 0.0f;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[repeat * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_quad_v7(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        quad_scores,
+                        batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        scaled_scores[repeat] += quad_scores[repeat];
+                    }
+                    continue;
+                }
+                for (uint pair_start = 0u; pair_start < repeat_count; pair_start += 2u) {
+                    uint pair_repeats = min(2u, repeat_count - pair_start);
+                    thread float query_values[2 * GROUP_SIZE];
+                    thread float pair_scores[2];
+                    pair_scores[0] = 0.0f;
+                    pair_scores[1] = 0.0f;
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        uint repeat = pair_start + pair;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[pair * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_pair_v7(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        pair_scores,
+                        pair_repeats, batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        scaled_scores[pair_start + pair] += pair_scores[pair];
+                    }
+                }
+            }
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] *= attention_scale;
+            }
+        }
+        tile_physical_tokens[lane] = physical_token;
+
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
             tile_scores[score_base + lane] = scaled_scores[repeat];
             partial[score_base + lane] = scaled_scores[repeat];
         }
@@ -5528,10 +6719,20 @@ inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQML
         tile_maxes[1] = -INFINITY;
         tile_maxes[2] = -INFINITY;
         tile_maxes[3] = -INFINITY;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            tile_maxes[repeat] = partial[repeat * threads_per_block];
+        }
+        // Every lane must finish reading the reduced maxes above BEFORE any lane
+        // overwrites partial[] with exp-weights below. Without this barrier, a lagging
+        // simdgroup can read lane 0's already-written weight as the "max" for a later
+        // repeat (the drift across the barrier-free repeat loop is widest at the last
+        // repeat), which intermittently corrupted the whole output row of the last GQA
+        // repeat (q_head = kv_head*4+3) at a 5-25% per-dispatch rate. Root-caused
+        // 2026-07-03; see artifacts/turboquant-v7-20260703/quad-nondeterminism.md.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         uint has_weight = 0u;
         for (uint repeat = 0u; repeat < repeat_count; repeat++) {
             uint score_base = repeat * threads_per_block;
-            tile_maxes[repeat] = partial[score_base];
             float tile_weight = active
                 ? exp(tile_scores[score_base + lane] - tile_maxes[repeat])
                 : 0.0f;
@@ -5558,7 +6759,7 @@ inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQML
             for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                 uint q_head = kv_head * gqa_repeats + repeat;
                 uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+                uint stat_index = ((row * block_count + block_index) * 2u);
                 uint score_base = repeat * threads_per_block;
                 partial_stats[stat_index] = tile_maxes[repeat];
                 partial_stats[stat_index + 1u] = partial[score_base];
@@ -5594,13 +6795,14 @@ inline constexpr std::string_view turbo_quant_gqa_block_partials_source = R"TQML
             for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                 uint q_head = kv_head * gqa_repeats + repeat;
                 uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
                 partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum[repeat]);
             }
         }
 )TQMLX";
 
 inline constexpr std::string_view turbo_quant_block_reduce_source = R"TQMLX(        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
         if (row >= uint(ROW_COUNT)) {
@@ -5610,8 +6812,8 @@ inline constexpr std::string_view turbo_quant_block_reduce_source = R"TQMLX(    
         threadgroup float partial[512];
         threadgroup float tile_scales[512];
 
-        if (lane < uint(BLOCK_COUNT)) {
-            partial[lane] = partial_stats[(row * uint(BLOCK_COUNT) + lane) * 2u];
+        if (lane < block_count) {
+            partial[lane] = partial_stats[(row * block_count + lane) * 2u];
         } else {
             partial[lane] = -INFINITY;
         }
@@ -5625,8 +6827,8 @@ inline constexpr std::string_view turbo_quant_block_reduce_source = R"TQMLX(    
         }
 
         float row_max = partial[0];
-        if (lane < uint(BLOCK_COUNT)) {
-            uint stat_index = (row * uint(BLOCK_COUNT) + lane) * 2u;
+        if (lane < block_count) {
+            uint stat_index = (row * block_count + lane) * 2u;
             float tile_sum = partial_stats[stat_index + 1u];
             float tile_scale = tile_sum > 0.0f ? exp(partial_stats[stat_index] - row_max) : 0.0f;
             tile_scales[lane] = tile_scale;
@@ -5647,10 +6849,10 @@ inline constexpr std::string_view turbo_quant_block_reduce_source = R"TQMLX(    
         float row_sum = partial[0];
         if (lane < uint(HEAD_DIM)) {
             float accum = 0.0f;
-            for (uint block = 0u; block < uint(BLOCK_COUNT); block++) {
+            for (uint block = 0u; block < block_count; block++) {
                 float tile_scale = tile_scales[block];
                 if (tile_scale > 0.0f) {
-                    uint partial_index = ((row * uint(BLOCK_COUNT) + block) * uint(HEAD_DIM)) + lane;
+                    uint partial_index = ((row * block_count + block) * uint(HEAD_DIM)) + lane;
                     accum += tile_scale * partial_out[partial_index];
                 }
             }
